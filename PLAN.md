@@ -80,6 +80,14 @@ Module: `github.com/ameenkh/gotasks`
 - [x] Per-type retention: `WithRetentionByType` overrides the default
       retention per task type (0 = keep that type forever); reaper applies it
       via a `$switch` pipeline expression
+- [x] Examples suite (`examples/`): scheduled, retries/dead-letter/requeue,
+      unique keys, heartbeat, at-most-once, batch fan-out, retention
+- [x] Scenario soak tests (`scenario_test.go`): 6 scenarios, each producing
+      and consuming against real Mongo for 30s (GOTASKS_SCENARIO_DURATION),
+      then draining and validating final state — exactly-once counts, retry
+      budgets, schedule timing, unique-key overlap, heartbeat no-reclaim
+- [x] GitHub Actions CI: build + vet + race tests + scenario soak on every
+      push to main and on PRs (Mongo 7 service container)
 
 ## v0.3 — Big-pipeline scale
 

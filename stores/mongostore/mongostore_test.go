@@ -167,13 +167,15 @@ func TestStaleReclaimRespectsMaxAttempts(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	retryable := enqueueOne(t, s, "job", `{"kind":"retryable"}`, 3, now)
-	once := enqueueOne(t, s, "job", `{"kind":"once"}`, 1, now)
+	retryable := enqueueOne(t, s, "jobA", `{"kind":"retryable"}`, 3, now)
+	once := enqueueOne(t, s, "jobB", `{"kind":"once"}`, 1, now)
 
-	// Claim both with an already-expired lease (dead workers).
-	for i := 0; i < 2; i++ {
-		if _, err := s.Claim(ctx, "dead", nil, -time.Second); err != nil {
-			t.Fatalf("Claim %d: %v", i, err)
+	// Claim both with an already-expired lease (dead workers). Claimed by
+	// type: with a negative lease the first task is instantly stale again,
+	// so an untyped second claim could just re-claim it.
+	for _, taskType := range []string{"jobA", "jobB"} {
+		if _, err := s.Claim(ctx, "dead", []string{taskType}, -time.Second); err != nil {
+			t.Fatalf("Claim %s: %v", taskType, err)
 		}
 	}
 

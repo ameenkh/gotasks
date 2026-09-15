@@ -1,5 +1,7 @@
 # gotasks
 
+[![CI](https://github.com/ameenkh/gotasks/actions/workflows/ci.yml/badge.svg)](https://github.com/ameenkh/gotasks/actions/workflows/ci.yml)
+
 Persistent, atomic, asynchronous task processing for Go — backed by a
 pluggable store (MongoDB first), with typed payloads, retries with backoff,
 scheduling, and lease-based fencing so no two workers ever run the same task.
@@ -63,7 +65,9 @@ m.RequeueDead(ctx, "email")    // requeue all dead email tasks ("" = all)
 m.Run(ctx)
 ```
 
-See `examples/simple` for a runnable version.
+See [examples/](examples/) for runnable scenarios covering every option:
+scheduling, retries + dead-letter + requeue, unique keys, heartbeat,
+at-most-once, batch fan-out, and retention.
 
 ## Task lifecycle
 
