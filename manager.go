@@ -79,9 +79,16 @@ func New(store Store, opts ...Option) (*Manager, error) {
 
 // Enqueue inserts one task of taskType with a typed payload (any value that
 // marshals to a JSON object; use struct{}{} for no payload). Returns the id.
+// With WithUniqueKey, a conflict returns the EXISTING active task's id along
+// with an error matching ErrDuplicateTask — treat it as idempotent success
+// when that suits the caller.
 func Enqueue[T any](ctx context.Context, m *Manager, taskType string, payload T, opts ...EnqueueOption) (string, error) {
 	ids, err := EnqueueMany(ctx, m, taskType, []T{payload}, opts...)
 	if err != nil {
+		var dup *DuplicateTaskError
+		if errors.As(err, &dup) {
+			return dup.ExistingID, err
+		}
 		return "", err
 	}
 	return ids[0], nil
@@ -106,6 +113,9 @@ func EnqueueMany[T any](ctx context.Context, m *Manager, taskType string, payloa
 	if eo.maxAttempts < 1 {
 		return nil, errors.New("gotasks: max attempts must be >= 1")
 	}
+	if eo.uniqueKey != "" && len(payloads) > 1 {
+		return nil, errors.New("gotasks: WithUniqueKey requires a single-task enqueue")
+	}
 	now := time.Now().UTC()
 	runAt := eo.runAt
 	if runAt.IsZero() {
@@ -119,6 +129,7 @@ func EnqueueMany[T any](ctx context.Context, m *Manager, taskType string, payloa
 		}
 		tasks[i] = &Task{
 			Type:        taskType,
+			UniqueKey:   eo.uniqueKey,
 			Payload:     raw,
 			Status:      StatusPending,
 			MaxAttempts: eo.maxAttempts,
@@ -196,15 +207,28 @@ func RegisterHandler[T any](m *Manager, taskType string, fn func(ctx context.Con
 }
 
 // ExtendLease pushes the task's lease forward by the manager's LeaseTime.
-// Call from inside a handler for work that outlives the lease (v0.2 will do
-// this automatically via heartbeat).
+// Rarely needed directly — the heartbeat does this automatically unless
+// disabled with WithoutHeartbeat.
 func (m *Manager) ExtendLease(ctx context.Context, t *Task) error {
-	until, err := m.store.ExtendLease(ctx, t.ID, t.LeaseToken, m.cfg.LeaseTime)
+	until, err := m.store.ExtendLease(ctx, t, m.cfg.LeaseTime)
 	if err != nil {
 		return err
 	}
 	t.LockedUntil = until
 	return nil
+}
+
+// Requeue resets one dead task to pending (attempts back to 0, runnable
+// now); its errors array is kept as history. Returns ErrNotFound if the id
+// doesn't exist or the task isn't dead.
+func (m *Manager) Requeue(ctx context.Context, id string) error {
+	return m.store.Requeue(ctx, id)
+}
+
+// RequeueDead requeues every dead task of taskType ("" = all types) with the
+// same resets as Requeue, returning how many were requeued.
+func (m *Manager) RequeueDead(ctx context.Context, taskType string) (int64, error) {
+	return m.store.RequeueDead(ctx, taskType)
 }
 
 // Start launches the worker pool and reaper. Non-blocking; pair with Stop.

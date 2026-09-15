@@ -103,7 +103,7 @@ func TestRetryThenTerminalFailure(t *testing.T) {
 	}
 	startManager(t, m)
 
-	task := waitForStatus(t, fs, id, StatusFailed)
+	task := waitForStatus(t, fs, id, StatusDead)
 	if task.Attempts != 2 {
 		t.Errorf("attempts = %d, want 2", task.Attempts)
 	}
@@ -150,7 +150,7 @@ func TestPanicIsAFailedAttempt(t *testing.T) {
 	id, _ := Enqueue(context.Background(), m, "panicky", struct{}{}, WithMaxAttempts(1))
 	startManager(t, m)
 
-	task := waitForStatus(t, fs, id, StatusFailed)
+	task := waitForStatus(t, fs, id, StatusDead)
 	if len(task.Errors) != 1 || !strings.Contains(task.Errors[0].Message, "kaboom") {
 		t.Errorf("panic not recorded: %+v", task.Errors)
 	}
@@ -168,7 +168,7 @@ func TestHandlerTimeout(t *testing.T) {
 	id, _ := Enqueue(context.Background(), m, "slow", struct{}{}, WithMaxAttempts(1))
 	startManager(t, m)
 
-	task := waitForStatus(t, fs, id, StatusFailed)
+	task := waitForStatus(t, fs, id, StatusDead)
 	if !strings.Contains(task.Errors[0].Message, "deadline") {
 		t.Errorf("expected deadline error, got: %+v", task.Errors)
 	}
@@ -220,7 +220,7 @@ func TestStaleTaskReclaimedThenCompletes(t *testing.T) {
 		t.Errorf("attempts = %d, want 2 (dead claim + reclaim)", task.Attempts)
 	}
 	// The dead worker's fenced write must fail: token rotated on reclaim.
-	if err := fs.Complete(ctx, dead.ID, dead.LeaseToken, nil); !errors.Is(err, ErrLeaseLost) {
+	if err := fs.Complete(ctx, dead, nil); !errors.Is(err, ErrLeaseLost) {
 		t.Errorf("stale worker write: got %v, want ErrLeaseLost", err)
 	}
 }
@@ -245,7 +245,7 @@ func TestAtMostOnceStaleIsReapedNotRetried(t *testing.T) {
 	})
 	startManager(t, m)
 
-	task := waitForStatus(t, fs, ids[0], StatusFailed) // reaper, not a worker
+	task := waitForStatus(t, fs, ids[0], StatusDead) // reaper, not a worker
 	if calls.Load() != 0 {
 		t.Errorf("at-most-once task was re-run %d times", calls.Load())
 	}
@@ -348,5 +348,190 @@ func TestBackoffStrategies(t *testing.T) {
 		if d < base || d > base+base/4 {
 			t.Errorf("exp attempt %d: %v outside [%v, %v]", attempt, d, base, base+base/4)
 		}
+	}
+}
+
+func TestHeartbeatKeepsLongHandlerAlive(t *testing.T) {
+	fs := newFakeStore()
+	// Lease far shorter than the handler; the opted-in heartbeat (auto =
+	// lease/3) must keep extending it so no other worker reclaims the task.
+	m := testManager(t, fs, WithLeaseTime(60*time.Millisecond), WithHeartbeat())
+
+	_ = RegisterHandler(m, "long", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		time.Sleep(250 * time.Millisecond)
+		return nil, nil
+	})
+
+	id, _ := Enqueue(context.Background(), m, "long", struct{}{}, WithMaxAttempts(3))
+	startManager(t, m)
+
+	task := waitForStatus(t, fs, id, StatusDone)
+	if task.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (heartbeat should prevent reclaim)", task.Attempts)
+	}
+	if len(task.Errors) != 0 {
+		t.Errorf("unexpected errors: %+v", task.Errors)
+	}
+}
+
+func TestNoHeartbeatByDefaultLongHandlerIsReclaimed(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs, WithLeaseTime(40*time.Millisecond), WithWorkers(2))
+
+	var calls atomic.Int32
+	release := make(chan struct{})
+	_ = RegisterHandler(m, "long", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		if calls.Add(1) == 1 {
+			<-release // first run outlives its lease
+			return nil, errors.New("stale worker finished late")
+		}
+		return nil, nil
+	})
+
+	id, _ := Enqueue(context.Background(), m, "long", struct{}{}, WithMaxAttempts(3))
+	startManager(t, m)
+
+	task := waitForStatus(t, fs, id, StatusDone) // second worker reclaims and finishes
+	if task.Attempts < 2 {
+		t.Errorf("attempts = %d, want >= 2 (reclaim expected without heartbeat)", task.Attempts)
+	}
+	close(release)
+}
+
+func TestHeartbeatLeaseLossCancelsHandler(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs,
+		WithLeaseTime(500*time.Millisecond),
+		WithHeartbeatInterval(10*time.Millisecond))
+
+	cancelled := make(chan struct{})
+	_ = RegisterHandler(m, "doomed", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		fs.forceLeaseLost.Store(true) // now every heartbeat sees ErrLeaseLost
+		select {
+		case <-ctx.Done():
+			close(cancelled)
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Second):
+			return nil, errors.New("handler was never cancelled")
+		}
+	})
+
+	_, _ = Enqueue(context.Background(), m, "doomed", struct{}{}, WithMaxAttempts(1))
+	startManager(t, m)
+
+	select {
+	case <-cancelled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler context was not cancelled on lease loss")
+	}
+	fs.forceLeaseLost.Store(false)
+}
+
+func TestDeadTaskRequeueRunsAgain(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs)
+
+	var calls atomic.Int32
+	_ = RegisterHandler(m, "flaky", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		if calls.Add(1) <= 2 {
+			return nil, errors.New("boom")
+		}
+		return nil, nil
+	})
+
+	id, _ := Enqueue(context.Background(), m, "flaky", struct{}{}, WithMaxAttempts(2))
+	startManager(t, m)
+
+	waitForStatus(t, fs, id, StatusDead)
+	if err := m.Requeue(context.Background(), id); err != nil {
+		t.Fatalf("Requeue: %v", err)
+	}
+	task := waitForStatus(t, fs, id, StatusDone)
+	if task.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (requeue resets attempts)", task.Attempts)
+	}
+	if len(task.Errors) != 2 {
+		t.Errorf("error history lost: %d entries, want 2", len(task.Errors))
+	}
+	// Requeueing a non-dead task must fail.
+	if err := m.Requeue(context.Background(), id); !errors.Is(err, ErrNotFound) {
+		t.Errorf("requeue done task: got %v, want ErrNotFound", err)
+	}
+}
+
+func TestRequeueDeadByType(t *testing.T) {
+	fs := newFakeStore()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	mk := func(taskType string) string {
+		ids, _ := fs.Enqueue(ctx, []*Task{{
+			Type: taskType, Status: StatusDead, MaxAttempts: 1, Attempts: 1,
+			RunAt: now, CreatedAt: now, UpdatedAt: now,
+		}})
+		return ids[0]
+	}
+	aID, b1ID, b2ID := mk("a"), mk("b"), mk("b")
+
+	m := testManager(t, fs)
+	n, err := m.RequeueDead(ctx, "b")
+	if err != nil || n != 2 {
+		t.Fatalf("RequeueDead(b) = %d, %v; want 2, nil", n, err)
+	}
+	if fs.get(aID).Status != StatusDead {
+		t.Error("type-a task requeued by mistake")
+	}
+	if fs.get(b1ID).Status != StatusPending || fs.get(b2ID).Status != StatusPending {
+		t.Error("type-b tasks not requeued")
+	}
+	if n, _ := m.RequeueDead(ctx, ""); n != 1 { // remaining dead: the type-a one
+		t.Errorf("RequeueDead(all) = %d, want 1", n)
+	}
+}
+
+func TestUniqueKeyDedup(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs)
+	ctx := context.Background()
+
+	_ = RegisterHandler(m, "sync", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		return nil, nil
+	})
+
+	id1, err := Enqueue(ctx, m, "sync", struct{}{}, WithUniqueKey("tenant-42"))
+	if err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	// Duplicate: must return the existing id + ErrDuplicateTask.
+	id2, err := Enqueue(ctx, m, "sync", struct{}{}, WithUniqueKey("tenant-42"))
+	if !errors.Is(err, ErrDuplicateTask) {
+		t.Fatalf("duplicate enqueue: got %v, want ErrDuplicateTask", err)
+	}
+	if id2 != id1 {
+		t.Errorf("duplicate returned id %q, want existing %q", id2, id1)
+	}
+	// A different key is fine.
+	if _, err := Enqueue(ctx, m, "sync", struct{}{}, WithUniqueKey("tenant-43")); err != nil {
+		t.Fatalf("different key: %v", err)
+	}
+
+	startManager(t, m)
+	waitForStatus(t, fs, id1, StatusDone)
+
+	// Done released the key: same key enqueues fresh.
+	id3, err := Enqueue(ctx, m, "sync", struct{}{}, WithUniqueKey("tenant-42"))
+	if err != nil {
+		t.Fatalf("re-enqueue after done: %v", err)
+	}
+	if id3 == id1 {
+		t.Error("expected a fresh task after key release")
+	}
+}
+
+func TestUniqueKeyRejectedForBatch(t *testing.T) {
+	m := testManager(t, newFakeStore())
+	_, err := EnqueueMany(context.Background(), m, "t",
+		[]struct{}{{}, {}}, WithUniqueKey("k"))
+	if err == nil {
+		t.Fatal("expected error for WithUniqueKey on a batch")
 	}
 }

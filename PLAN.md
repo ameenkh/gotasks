@@ -62,12 +62,24 @@ Module: `github.com/ameenkh/gotasks`
 
 ## v0.2 — Robustness
 
-- [ ] Heartbeat: auto ExtendLease for long-running handlers
-- [ ] Dead-letter status distinct from `failed`; `Requeue`/`RequeueAll`
-- [ ] Unique/idempotent tasks (`unique_key`, partial unique index)
-- [ ] Recurring/cron tasks + leader election via internal lease (golocks idea)
-- [ ] `Cancel(id)` for pending; cooperative cancel for running
-- [ ] Per-type retention (expiry from `max(run_at, now) + retention[type]`)
+- [x] Heartbeat: auto ExtendLease for long-running handlers — opt-in via
+      `WithHeartbeat` (LeaseTime/3) or `WithHeartbeatInterval`; off by
+      default so the library adds zero background writes unless asked. On
+      lease loss the handler's context is cancelled — no burning work
+      someone else owns.
+- [x] Dead-letter status `dead` (replaces terminal `failed`); `Requeue(id)` +
+      `RequeueDead(type)` reset attempts and clear retention expiry, keeping
+      the errors array as history
+- [x] Unique/idempotent tasks: `WithUniqueKey` + partial unique index; key
+      held while pending/running (kept across retries), released at done/dead;
+      conflict returns existing id + ErrDuplicateTask
+- [ ] Recurring/cron tasks + leader election via internal lease (golocks
+      idea) — deferred, to discuss
+- [ ] `Cancel(id)` for pending; cooperative cancel for running — deferred,
+      to discuss
+- [x] Per-type retention: `WithRetentionByType` overrides the default
+      retention per task type (0 = keep that type forever); reaper applies it
+      via a `$switch` pipeline expression
 
 ## v0.3 — Big-pipeline scale
 

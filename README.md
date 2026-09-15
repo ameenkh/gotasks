@@ -46,10 +46,18 @@ gotasks.RegisterHandler(m, "email",
 // From anywhere (workers optional in the enqueuing process):
 id, err := gotasks.Enqueue(ctx, m, "email", EmailPayload{To: "a@b.c", Subject: "hi"})
 
-// Scheduled / delayed / at-most-once:
+// Scheduled / delayed / at-most-once / idempotent:
 gotasks.Enqueue(ctx, m, "email", p, gotasks.WithRunAt(tomorrow))
 gotasks.Enqueue(ctx, m, "email", p, gotasks.WithDelay(10*time.Minute))
 gotasks.Enqueue(ctx, m, "provision", p, gotasks.WithMaxAttempts(1))
+
+// At most one active task per key; a conflict returns the existing id
+// and an error matching gotasks.ErrDuplicateTask:
+id, err = gotasks.Enqueue(ctx, m, "sync", p, gotasks.WithUniqueKey("tenant-42"))
+
+// Dead-letter management:
+m.Requeue(ctx, id)             // reset one dead task (attempts back to 0)
+m.RequeueDead(ctx, "email")    // requeue all dead email tasks ("" = all)
 
 // Blocking run (Ctrl-C to drain and exit), or Start()/Stop(ctx):
 m.Run(ctx)
@@ -62,20 +70,46 @@ See `examples/simple` for a runnable version.
 ```
 pending ──claim (atomic, +1 attempt, new lease)──▶ running ──ok──▶ done
    ▲                                                  │
-   └────── retry: run_at = now + backoff ──────error──┤
-                (while attempts < max_attempts)       └──▶ failed
+   ├────── retry: run_at = now + backoff ──────error──┤
+   │            (while attempts < max_attempts)       └──▶ dead
+   └───────────── Requeue / RequeueDead ◀─────────────────────┘
 ```
 
 - A **claim is an attempt**: `attempts` is incremented by the claim itself,
   so work lost to a crashed worker still counts.
+- An **opt-in heartbeat** (`WithHeartbeat()`, or `WithHeartbeatInterval(d)`)
+  extends the running task's lease every LeaseTime/3, so handlers may run
+  longer than LeaseTime. If the heartbeat finds the lease was lost, the
+  handler's context is cancelled. **Off by default**: without it, make sure
+  LeaseTime exceeds your longest handler run (or call `Manager.ExtendLease`
+  from inside the handler).
 - A `running` task whose lease (`locked_until`) expired is **reclaimed** by
   the next claim — but only while `attempts < max_attempts`. Setting
   `max_attempts: 1` therefore gives at-most-once execution: never retried on
   error, never re-run after a worker dies.
 - A **reaper** periodically marks lease-expired tasks with no attempts left
-  as `failed` (error: "lease expired"), so nothing lingers as a zombie.
+  as `dead` (error: "lease expired"), so nothing lingers as a zombie.
+- **`dead` is the dead-letter state**: inspect, then `Requeue(id)` or
+  `RequeueDead(type)` to run again with a fresh attempts budget (the errors
+  array is kept as history), or let retention prune them.
+- **Unique keys** (`WithUniqueKey`) are held while a task is pending/running
+  (including across retries) and released at done/dead.
 - Every failed attempt is appended to the task's `errors` array
   (`{at, attempt, worker, message}`).
+
+## Retention
+
+Finished tasks (done/dead) can auto-prune via a TTL index:
+
+```go
+mongostore.New(ctx, uri,
+    mongostore.WithRetention(7*24*time.Hour), // default for all types
+    mongostore.WithRetentionByType(map[string]time.Duration{
+        "email":     24 * time.Hour, // noisy, short-lived
+        "provision": 0,              // money trail: keep forever
+    }),
+)
+```
 
 ## Requirements
 
@@ -84,9 +118,10 @@ pending ──claim (atomic, +1 attempt, new lease)──▶ running ──ok─
 
 ## Status / roadmap
 
-v0.1 (current): core queue, Mongo store, worker pool, retries/backoff,
-scheduling, reaper. See [PLAN.md](PLAN.md) for the full roadmap
-(heartbeats, cron + leader election, unique tasks, batch claim, priorities,
+v0.2 (current): core queue, Mongo store, worker pool, retries/backoff,
+scheduling, reaper, heartbeat, dead-letter + requeue, unique tasks,
+per-type retention. See [PLAN.md](PLAN.md) for the full roadmap
+(cron + leader election, cancellation, batch claim, priorities,
 change-stream wakeup, Postgres store, metrics...).
 
 ## License

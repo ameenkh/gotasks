@@ -18,7 +18,10 @@ const (
 	StatusPending Status = "pending" // waiting for a worker (run_at may be in the future)
 	StatusRunning Status = "running" // claimed under a live lease
 	StatusDone    Status = "done"    // handler succeeded
-	StatusFailed  Status = "failed"  // attempts exhausted (or lease expired with no attempts left)
+	// StatusDead is the dead-letter state: attempts exhausted (or lease
+	// expired with none left). Dead tasks sit inspectable until requeued
+	// (Manager.Requeue / RequeueDead) or pruned by retention.
+	StatusDead Status = "dead"
 )
 
 // TaskError is one failed attempt, kept on the task in order.
@@ -34,6 +37,7 @@ type TaskError struct {
 type Task struct {
 	ID          string          `json:"id"`
 	Type        string          `json:"type"`
+	UniqueKey   string          `json:"unique_key,omitempty"` // dedup key: at most one pending/running task per key
 	Payload     json.RawMessage `json:"payload,omitempty"`
 	Status      Status          `json:"status"`
 	Attempts    int             `json:"attempts"`     // claims so far (a claim IS an attempt)

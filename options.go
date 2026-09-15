@@ -24,9 +24,17 @@ type Config struct {
 	DefaultTimeout time.Duration
 	// Backoff computes retry delays. Default ExponentialBackoff(30s, 1h).
 	Backoff Backoff
-	// ReapInterval is how often stale+exhausted tasks are swept to failed.
+	// ReapInterval is how often stale+exhausted tasks are swept to dead.
 	// 0 disables the reaper. Default 60s.
 	ReapInterval time.Duration
+	// HeartbeatInterval controls automatic lease extension while a handler
+	// runs, letting handlers outlive LeaseTime without being reclaimed.
+	// 0 (default) disables the heartbeat — handlers must then finish within
+	// LeaseTime, or call Manager.ExtendLease themselves. HeartbeatAuto
+	// derives LeaseTime/3; a positive value is used as-is. When the
+	// heartbeat discovers the lease was lost (the task was reclaimed), the
+	// handler's context is cancelled.
+	HeartbeatInterval time.Duration
 	// Logger receives worker/reaper diagnostics. Default slog.Default().
 	Logger *slog.Logger
 }
@@ -43,10 +51,26 @@ func WithBackoff(b Backoff) Option              { return func(c *Config) { c.Bac
 func WithReapInterval(d time.Duration) Option   { return func(c *Config) { c.ReapInterval = d } }
 func WithLogger(l *slog.Logger) Option          { return func(c *Config) { c.Logger = l } }
 
+// HeartbeatAuto selects the automatic heartbeat cadence: LeaseTime/3.
+const HeartbeatAuto time.Duration = -1
+
+// WithHeartbeat enables automatic lease extension at the auto cadence
+// (LeaseTime/3). Off by default.
+func WithHeartbeat() Option {
+	return func(c *Config) { c.HeartbeatInterval = HeartbeatAuto }
+}
+
+// WithHeartbeatInterval enables automatic lease extension at an explicit
+// cadence (or HeartbeatAuto for LeaseTime/3; 0 keeps it disabled).
+func WithHeartbeatInterval(d time.Duration) Option {
+	return func(c *Config) { c.HeartbeatInterval = d }
+}
+
 type enqueueOptions struct {
 	runAt       time.Time
 	delay       time.Duration
 	maxAttempts int // 0 = manager default
+	uniqueKey   string
 }
 
 // EnqueueOption configures a single Enqueue/EnqueueMany call.
@@ -66,6 +90,15 @@ func WithDelay(d time.Duration) EnqueueOption {
 // enqueue. Use 1 for at-most-once work (never retried, stale never reclaimed).
 func WithMaxAttempts(n int) EnqueueOption {
 	return func(o *enqueueOptions) { o.maxAttempts = n }
+}
+
+// WithUniqueKey makes the enqueue idempotent: at most one pending/running
+// task per key. A conflicting enqueue returns the existing task's id and an
+// error matching ErrDuplicateTask. The key is released when the task reaches
+// done or dead. Single-task Enqueue only (a batch sharing one key would just
+// dedupe itself to the first element).
+func WithUniqueKey(key string) EnqueueOption {
+	return func(o *enqueueOptions) { o.uniqueKey = key }
 }
 
 type handlerOptions struct {

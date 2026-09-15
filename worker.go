@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
-// finalizeTimeout bounds the Complete/Fail write after a handler returns.
-// It runs on a context detached from cancellation so results of finished
-// work are recorded even during shutdown.
+// finalizeTimeout bounds the Complete/Fail write after a handler returns,
+// and each heartbeat write. These run on a context detached from
+// cancellation so results of finished work are recorded even during shutdown.
 const finalizeTimeout = 15 * time.Second
 
 // workerLoop is the railway loop: keep claiming while tasks come back; sleep
@@ -49,18 +50,24 @@ func (m *Manager) process(workerID string, t *Task) {
 		m.cfg.Logger.Error("gotasks: claimed task with no handler", "type", t.Type, "id", t.ID)
 		return
 	}
+	// base is cancelled by the heartbeat when it discovers the lease was
+	// lost — no point burning work another worker now owns.
+	base, baseCancel := context.WithCancel(m.runCtx)
+	defer baseCancel()
+	hctx := base
 	timeout := entry.timeout
 	if timeout == 0 {
 		timeout = m.cfg.DefaultTimeout
 	}
-	hctx := m.runCtx
 	if timeout > 0 {
 		var cancel context.CancelFunc
-		hctx, cancel = context.WithTimeout(hctx, timeout)
+		hctx, cancel = context.WithTimeout(base, timeout)
 		defer cancel()
 	}
 
+	stopHeartbeat := m.startHeartbeat(t, baseCancel)
 	result, err := m.invoke(entry, hctx, t)
+	stopHeartbeat()
 
 	fctx, cancel := context.WithTimeout(context.WithoutCancel(m.runCtx), finalizeTimeout)
 	defer cancel()
@@ -70,17 +77,71 @@ func (m *Manager) process(workerID string, t *Task) {
 		now := time.Now().UTC()
 		taskErr := TaskError{At: now, Attempt: t.Attempts, Worker: workerID, Message: err.Error()}
 		retryAt := now.Add(m.cfg.Backoff.Next(t.Attempts))
-		if ferr := m.store.Fail(fctx, t.ID, t.LeaseToken, taskErr, retryAt, terminal); ferr != nil {
-			m.cfg.Logger.Error("gotasks: recording failure failed", "id", t.ID, "type", t.Type, "error", ferr)
+		if ferr := m.store.Fail(fctx, t, taskErr, retryAt, terminal); ferr != nil {
+			if errors.Is(ferr, ErrLeaseLost) {
+				m.cfg.Logger.Warn("gotasks: task was reclaimed before failure could be recorded",
+					"id", t.ID, "type", t.Type)
+			} else {
+				m.cfg.Logger.Error("gotasks: recording failure failed", "id", t.ID, "type", t.Type, "error", ferr)
+			}
 		}
 		m.cfg.Logger.Warn("gotasks: task attempt failed",
 			"id", t.ID, "type", t.Type, "attempt", t.Attempts, "max_attempts", t.MaxAttempts,
 			"terminal", terminal, "error", err)
 		return
 	}
-	if cerr := m.store.Complete(fctx, t.ID, t.LeaseToken, result); cerr != nil {
-		m.cfg.Logger.Error("gotasks: completing task failed", "id", t.ID, "type", t.Type, "error", cerr)
+	if cerr := m.store.Complete(fctx, t, result); cerr != nil {
+		if errors.Is(cerr, ErrLeaseLost) {
+			m.cfg.Logger.Warn("gotasks: task was reclaimed before completion could be recorded",
+				"id", t.ID, "type", t.Type)
+		} else {
+			m.cfg.Logger.Error("gotasks: completing task failed", "id", t.ID, "type", t.Type, "error", cerr)
+		}
 	}
+}
+
+// startHeartbeat extends t's lease every interval until stopped, so handlers
+// may outlive LeaseTime. Disabled by default (interval 0); HeartbeatAuto
+// derives LeaseTime/3. On ErrLeaseLost it calls onLost (cancelling the
+// handler's context) and exits. Returns an idempotent stop func.
+func (m *Manager) startHeartbeat(t *Task, onLost context.CancelFunc) (stop func()) {
+	interval := m.cfg.HeartbeatInterval
+	if interval == 0 {
+		return func() {}
+	}
+	if interval < 0 {
+		interval = m.cfg.LeaseTime / 3
+	}
+	if interval <= 0 {
+		return func() {}
+	}
+	stopCh := make(chan struct{})
+	var once sync.Once
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.WithoutCancel(m.runCtx), finalizeTimeout)
+				_, err := m.store.ExtendLease(ctx, t, m.cfg.LeaseTime)
+				cancel()
+				if errors.Is(err, ErrLeaseLost) {
+					m.cfg.Logger.Warn("gotasks: lease lost mid-run; cancelling handler",
+						"id", t.ID, "type", t.Type)
+					onLost()
+					return
+				}
+				if err != nil {
+					m.cfg.Logger.Error("gotasks: heartbeat lease extension failed",
+						"id", t.ID, "type", t.Type, "error", err)
+				}
+			}
+		}
+	}()
+	return func() { once.Do(func() { close(stopCh) }) }
 }
 
 // invoke runs the handler with panic recovery — a panic consumes an attempt
