@@ -33,6 +33,11 @@ type Manager struct {
 	claimCtx    context.Context    // cancelled first on Stop: stop claiming, drain in-flight
 	claimCancel context.CancelFunc
 	wg          sync.WaitGroup
+
+	// Batch mode (MaxBatch > 1) only: the fetcher fills taskCh, workers
+	// drain it and nudge the fetcher after each take.
+	taskCh     chan *Task
+	fetchNudge chan struct{}
 }
 
 // New creates a Manager on top of a Store.
@@ -48,6 +53,7 @@ func New(store Store, opts ...Option) (*Manager, error) {
 		DefaultTimeout:     60 * time.Second,
 		Backoff:            ExponentialBackoff(30*time.Second, time.Hour),
 		ReapInterval:       60 * time.Second,
+		MaxBatch:           1,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -66,6 +72,12 @@ func New(store Store, opts ...Option) (*Manager, error) {
 	}
 	if cfg.Backoff == nil {
 		return nil, errors.New("gotasks: Backoff must not be nil")
+	}
+	if cfg.MaxBatch < 1 || cfg.MaxBatch > 100 {
+		return nil, errors.New("gotasks: MaxBatch must be between 1 and 100")
+	}
+	if cfg.QueueLeaseTime < 0 {
+		return nil, errors.New("gotasks: QueueLeaseTime must be >= 0")
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -116,6 +128,9 @@ func EnqueueMany[T any](ctx context.Context, m *Manager, taskType string, payloa
 	if eo.uniqueKey != "" && len(payloads) > 1 {
 		return nil, errors.New("gotasks: WithUniqueKey requires a single-task enqueue")
 	}
+	if eo.queue == "" {
+		eo.queue = DefaultQueue
+	}
 	now := time.Now().UTC()
 	runAt := eo.runAt
 	if runAt.IsZero() {
@@ -128,6 +143,7 @@ func EnqueueMany[T any](ctx context.Context, m *Manager, taskType string, payloa
 			return nil, err
 		}
 		tasks[i] = &Task{
+			Queue:       eo.queue,
 			Type:        taskType,
 			UniqueKey:   eo.uniqueKey,
 			Payload:     raw,
@@ -206,6 +222,17 @@ func RegisterHandler[T any](m *Manager, taskType string, fn func(ctx context.Con
 	return nil
 }
 
+// claimOptions builds the ClaimOptions shared by all claim call sites.
+func (m *Manager) claimOptions(workerID string, lease time.Duration) ClaimOptions {
+	return ClaimOptions{
+		WorkerID: workerID,
+		Types:    m.types,
+		Queues:   m.cfg.Queues,
+		FIFO:     m.cfg.FIFO,
+		Lease:    lease,
+	}
+}
+
 // ExtendLease pushes the task's lease forward by the manager's LeaseTime.
 // Rarely needed directly — the heartbeat does this automatically unless
 // disabled with WithoutHeartbeat.
@@ -248,15 +275,30 @@ func (m *Manager) Start() error {
 	m.runCtx, m.runCancel = context.WithCancel(context.Background())
 	m.claimCtx, m.claimCancel = context.WithCancel(m.runCtx)
 
-	for i := 0; i < m.cfg.Workers; i++ {
+	if m.cfg.MaxBatch > 1 {
+		// Batch mode: one fetcher feeds a bounded channel; the bound is the
+		// backpressure (capacity covers busy workers plus one full batch).
+		m.taskCh = make(chan *Task, m.cfg.Workers+m.cfg.MaxBatch)
+		m.fetchNudge = make(chan struct{}, 1)
 		m.wg.Add(1)
-		go m.workerLoop(fmt.Sprintf("worker-%d", i))
+		go m.fetcherLoop()
+		for i := 0; i < m.cfg.Workers; i++ {
+			m.wg.Add(1)
+			go m.batchWorkerLoop(fmt.Sprintf("worker-%d", i))
+		}
+	} else {
+		// Single mode: workers claim directly, no fetcher, no handshake.
+		for i := 0; i < m.cfg.Workers; i++ {
+			m.wg.Add(1)
+			go m.workerLoop(fmt.Sprintf("worker-%d", i))
+		}
 	}
 	if m.cfg.ReapInterval > 0 {
 		m.wg.Add(1)
 		go m.reaperLoop()
 	}
-	m.cfg.Logger.Info("gotasks: started", "workers", m.cfg.Workers, "types", m.types)
+	m.cfg.Logger.Info("gotasks: started",
+		"workers", m.cfg.Workers, "max_batch", m.cfg.MaxBatch, "types", m.types)
 	return nil
 }
 

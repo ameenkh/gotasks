@@ -63,7 +63,7 @@ func TestClaimCompleteRoundTrip(t *testing.T) {
 
 	enqueueOne(t, s, "email", `{"to":"a@b.c","n":7}`, 3, now)
 
-	task, err := s.Claim(ctx, "w1", []string{"email"}, time.Minute)
+	task, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w1", Types: []string{"email"}, Lease: time.Minute})
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestClaimCompleteRoundTrip(t *testing.T) {
 	if err := s.Complete(ctx, task, nil); !errors.Is(err, gotasks.ErrLeaseLost) {
 		t.Fatalf("double complete: got %v, want ErrLeaseLost", err)
 	}
-	if _, err := s.Claim(ctx, "w1", nil, time.Minute); !errors.Is(err, gotasks.ErrNoTask) {
+	if _, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w1", Lease: time.Minute}); !errors.Is(err, gotasks.ErrNoTask) {
 		t.Fatalf("claim on empty queue: got %v, want ErrNoTask", err)
 	}
 }
@@ -104,7 +104,7 @@ func TestConcurrentClaimsAreExclusive(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for {
-				task, err := s.Claim(ctx, fmt.Sprintf("w%d", w), nil, time.Minute)
+				task, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: fmt.Sprintf("w%d", w), Lease: time.Minute})
 				if errors.Is(err, gotasks.ErrNoTask) {
 					return
 				}
@@ -137,7 +137,7 @@ func TestFailRetryAndTerminal(t *testing.T) {
 
 	enqueueOne(t, s, "flaky", `{"x":1}`, 2, now)
 
-	task, err := s.Claim(ctx, "w1", nil, time.Minute)
+	task, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w1", Lease: time.Minute})
 	if err != nil {
 		t.Fatalf("Claim 1: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestFailRetryAndTerminal(t *testing.T) {
 		t.Fatalf("Fail 1: %v", err)
 	}
 
-	task, err = s.Claim(ctx, "w2", nil, time.Minute)
+	task, err = s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w2", Lease: time.Minute})
 	if err != nil {
 		t.Fatalf("Claim 2 (retry): %v", err)
 	}
@@ -157,7 +157,7 @@ func TestFailRetryAndTerminal(t *testing.T) {
 	if err := s.Fail(ctx, task, te, now, true); err != nil {
 		t.Fatalf("Fail terminal: %v", err)
 	}
-	if _, err := s.Claim(ctx, "w3", nil, time.Minute); !errors.Is(err, gotasks.ErrNoTask) {
+	if _, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w3", Lease: time.Minute}); !errors.Is(err, gotasks.ErrNoTask) {
 		t.Fatalf("failed task still claimable: %v", err)
 	}
 }
@@ -174,20 +174,20 @@ func TestStaleReclaimRespectsMaxAttempts(t *testing.T) {
 	// type: with a negative lease the first task is instantly stale again,
 	// so an untyped second claim could just re-claim it.
 	for _, taskType := range []string{"jobA", "jobB"} {
-		if _, err := s.Claim(ctx, "dead", []string{taskType}, -time.Second); err != nil {
+		if _, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "dead", Types: []string{taskType}, Lease: -time.Second}); err != nil {
 			t.Fatalf("Claim %s: %v", taskType, err)
 		}
 	}
 
 	// Only the retryable one may be reclaimed.
-	task, err := s.Claim(ctx, "alive", nil, time.Minute)
+	task, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "alive", Lease: time.Minute})
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
 	if task.ID != retryable || task.Attempts != 2 {
 		t.Fatalf("wrong reclaim: %+v (want id %s)", task, retryable)
 	}
-	if _, err := s.Claim(ctx, "alive", nil, time.Minute); !errors.Is(err, gotasks.ErrNoTask) {
+	if _, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "alive", Lease: time.Minute}); !errors.Is(err, gotasks.ErrNoTask) {
 		t.Fatalf("at-most-once task was reclaimed: %v", err)
 	}
 
@@ -219,7 +219,7 @@ func TestExtendLeaseAndFencing(t *testing.T) {
 	now := time.Now().UTC()
 
 	enqueueOne(t, s, "long", `{"x":1}`, 3, now)
-	task, err := s.Claim(ctx, "w1", nil, time.Minute)
+	task, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w1", Lease: time.Minute})
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -242,14 +242,14 @@ func TestScheduledTaskNotClaimableEarly(t *testing.T) {
 	ctx := context.Background()
 
 	enqueueOne(t, s, "later", `{"x":1}`, 3, time.Now().UTC().Add(time.Hour))
-	if _, err := s.Claim(ctx, "w1", nil, time.Minute); !errors.Is(err, gotasks.ErrNoTask) {
+	if _, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w1", Lease: time.Minute}); !errors.Is(err, gotasks.ErrNoTask) {
 		t.Fatalf("future task claimed: %v", err)
 	}
 }
 
 func claimOne(t *testing.T, s *Store, worker string) *gotasks.Task {
 	t.Helper()
-	task, err := s.Claim(context.Background(), worker, nil, time.Minute)
+	task, err := s.Claim(context.Background(), gotasks.ClaimOptions{WorkerID: worker, Lease: time.Minute})
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestRequeueDeadTask(t *testing.T) {
 	}
 
 	// Dead task is not claimable; requeue resets it.
-	if _, err := s.Claim(ctx, "w2", nil, time.Minute); !errors.Is(err, gotasks.ErrNoTask) {
+	if _, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w2", Lease: time.Minute}); !errors.Is(err, gotasks.ErrNoTask) {
 		t.Fatalf("dead task claimable: %v", err)
 	}
 	if err := s.Requeue(ctx, id); err != nil {
@@ -449,5 +449,212 @@ func TestPerTypeRetention(t *testing.T) {
 	}
 	if e := expiresOf(reapIDs["audit"]); e != nil {
 		t.Errorf("reaped audit expires_at = %v, want none", e)
+	}
+}
+
+func TestClaimBatchBasics(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	for i := 0; i < 10; i++ {
+		enqueueOne(t, s, "bulk", fmt.Sprintf(`{"i":%d}`, i), 3, now)
+	}
+
+	batch, err := s.ClaimBatch(ctx, gotasks.ClaimOptions{WorkerID: "f1", Types: []string{"bulk"}, Lease: 90 * time.Second}, 4)
+	if err != nil {
+		t.Fatalf("ClaimBatch: %v", err)
+	}
+	if len(batch) != 4 {
+		t.Fatalf("claimed %d, want 4", len(batch))
+	}
+	token := batch[0].LeaseToken
+	for _, task := range batch {
+		if task.Status != gotasks.StatusRunning || task.Attempts != 1 {
+			t.Errorf("bad claimed task: %+v", task)
+		}
+		if task.LeaseToken != token {
+			t.Errorf("batch tasks must share one lease token")
+		}
+		if task.LockedUntil.Before(now.Add(80 * time.Second)) {
+			t.Errorf("queue lease not applied: %v", task.LockedUntil)
+		}
+	}
+
+	// Short batch: only 6 remain although we ask for 20.
+	batch, err = s.ClaimBatch(ctx, gotasks.ClaimOptions{WorkerID: "f1", Lease: time.Minute}, 20)
+	if err != nil || len(batch) != 6 {
+		t.Fatalf("short batch: %d tasks, %v; want 6", len(batch), err)
+	}
+	// Empty queue.
+	if _, err := s.ClaimBatch(ctx, gotasks.ClaimOptions{WorkerID: "f1", Lease: time.Minute}, 5); !errors.Is(err, gotasks.ErrNoTask) {
+		t.Fatalf("empty claim: got %v, want ErrNoTask", err)
+	}
+}
+
+func TestClaimBatchConcurrentExclusive(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	const total = 60
+	for i := 0; i < total; i++ {
+		enqueueOne(t, s, "job", fmt.Sprintf(`{"i":%d}`, i), 3, now)
+	}
+
+	var mu sync.Mutex
+	claimed := map[string]int{}
+	var wg sync.WaitGroup
+	for f := 0; f < 4; f++ {
+		wg.Add(1)
+		go func(f int) {
+			defer wg.Done()
+			for {
+				batch, err := s.ClaimBatch(ctx, gotasks.ClaimOptions{WorkerID: fmt.Sprintf("f%d", f), Lease: time.Minute}, 7)
+				if errors.Is(err, gotasks.ErrNoTask) {
+					return
+				}
+				if err != nil {
+					t.Errorf("ClaimBatch: %v", err)
+					return
+				}
+				mu.Lock()
+				for _, task := range batch {
+					claimed[task.ID]++
+				}
+				mu.Unlock()
+				// len(batch)==0 (all candidates stolen) → just retry.
+			}
+		}(f)
+	}
+	wg.Wait()
+
+	if len(claimed) != total {
+		t.Fatalf("claimed %d distinct tasks, want %d", len(claimed), total)
+	}
+	for id, c := range claimed {
+		if c != 1 {
+			t.Errorf("task %s claimed %d times", id, c)
+		}
+	}
+}
+
+func TestClaimBatchRespectsStaleAndAttempts(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	fresh := enqueueOne(t, s, "freshT", `{"kind":"fresh"}`, 3, now)
+	stale := enqueueOne(t, s, "staleT", `{"kind":"stale-retryable"}`, 3, now)
+	spent := enqueueOne(t, s, "spentT", `{"kind":"stale-exhausted"}`, 1, now)
+
+	// Make the last two stale via type-targeted claims with an expired
+	// lease (negative-lease tasks are instantly stale again, so untyped
+	// setup claims would just re-take the same doc).
+	for _, taskType := range []string{"staleT", "spentT"} {
+		if _, err := s.ClaimBatch(ctx, gotasks.ClaimOptions{WorkerID: "dead", Types: []string{taskType}, Lease: -time.Second}, 1); err != nil {
+			t.Fatalf("stale setup %s: %v", taskType, err)
+		}
+	}
+
+	// Batch-claimable now: fresh (pending) and stale (stale reclaim,
+	// attempts remaining). Spent (stale, attempts exhausted) must not be.
+	batch, err := s.ClaimBatch(ctx, gotasks.ClaimOptions{WorkerID: "alive", Lease: time.Minute}, 10)
+	if err != nil {
+		t.Fatalf("ClaimBatch: %v", err)
+	}
+	got := map[string]int{}
+	for _, task := range batch {
+		got[task.ID] = task.Attempts
+	}
+	if len(batch) != 2 || got[fresh] != 1 || got[stale] != 2 {
+		t.Fatalf("claimed %v, want {fresh:1 attempt, stale:2 attempts}", got)
+	}
+	if _, ok := got[spent]; ok {
+		t.Fatalf("at-most-once stale task was batch-claimed")
+	}
+}
+
+func TestFIFOClaimOrder(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour)
+
+	// Distinct run_at values, enqueued out of order.
+	for _, m := range []int{30, 10, 50, 20, 40} {
+		enqueueOne(t, s, "job", fmt.Sprintf(`{"m":%d}`, m), 3, base.Add(time.Duration(m)*time.Minute))
+	}
+	var got []string
+	for {
+		task, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w1", FIFO: true, Lease: time.Minute})
+		if errors.Is(err, gotasks.ErrNoTask) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		got = append(got, string(task.Payload))
+	}
+	want := []string{`{"m":10}`, `{"m":20}`, `{"m":30}`, `{"m":40}`, `{"m":50}`}
+	if len(got) != len(want) {
+		t.Fatalf("claimed %d tasks, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if !strings.Contains(got[i], want[i][1:len(want[i])-1]) {
+			t.Fatalf("FIFO order broken: got %v, want ascending run_at %v", got, want)
+		}
+	}
+
+	// FIFO batch claim preserves the order too.
+	for _, m := range []int{3, 1, 2} {
+		enqueueOne(t, s, "job2", fmt.Sprintf(`{"m":%d}`, m), 3, base.Add(time.Duration(m)*time.Minute))
+	}
+	batch, err := s.ClaimBatch(ctx, gotasks.ClaimOptions{WorkerID: "f1", Types: []string{"job2"}, FIFO: true, Lease: time.Minute}, 2)
+	if err != nil || len(batch) != 2 {
+		t.Fatalf("ClaimBatch: %d, %v", len(batch), err)
+	}
+	if !strings.Contains(string(batch[0].Payload), `"m":1`) || !strings.Contains(string(batch[1].Payload), `"m":2`) {
+		t.Fatalf("FIFO batch order broken: %s, %s", batch[0].Payload, batch[1].Payload)
+	}
+}
+
+func TestQueueFieldAndFiltering(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	mk := func(queue string) string {
+		ids, err := s.Enqueue(ctx, []*gotasks.Task{{
+			Queue: queue, Type: "job", Payload: []byte(`{"x":1}`),
+			Status: gotasks.StatusPending, MaxAttempts: 3,
+			RunAt: now, CreatedAt: now, UpdatedAt: now,
+		}})
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		return ids[0]
+	}
+	emailID := mk("emails")
+	mk("reports")
+	defaulted := mk("") // store defaults empty to DefaultQueue
+
+	// A manager restricted to "emails" sees only that queue.
+	task, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w1", Queues: []string{"emails"}, Lease: time.Minute})
+	if err != nil || task.ID != emailID || task.Queue != "emails" {
+		t.Fatalf("queue claim: %+v, %v (want %s)", task, err, emailID)
+	}
+	if _, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w1", Queues: []string{"emails"}, Lease: time.Minute}); !errors.Is(err, gotasks.ErrNoTask) {
+		t.Fatalf("emails queue should be empty: %v", err)
+	}
+
+	// Batch claim with a queue filter.
+	batch, err := s.ClaimBatch(ctx, gotasks.ClaimOptions{WorkerID: "f1", Queues: []string{"reports", gotasks.DefaultQueue}, Lease: time.Minute}, 10)
+	if err != nil || len(batch) != 2 {
+		t.Fatalf("queue batch: %d, %v; want 2", len(batch), err)
+	}
+	for _, task := range batch {
+		if task.ID == defaulted && task.Queue != gotasks.DefaultQueue {
+			t.Errorf("empty queue not defaulted: %+v", task)
+		}
 	}
 }

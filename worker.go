@@ -9,9 +9,16 @@ import (
 )
 
 // finalizeTimeout bounds the Complete/Fail write after a handler returns,
-// and each heartbeat write. These run on a context detached from
-// cancellation so results of finished work are recorded even during shutdown.
+// each heartbeat write, and the start-of-work handshake. These run on a
+// context detached from cancellation so results of finished work are
+// recorded even during shutdown.
 const finalizeTimeout = 15 * time.Second
+
+// finalizeContext returns a context for store writes that must survive
+// shutdown cancellation (bounded by finalizeTimeout instead).
+func (m *Manager) finalizeContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(m.runCtx), finalizeTimeout)
+}
 
 // workerLoop is the railway loop: keep claiming while tasks come back; sleep
 // PollInterval only after an empty claim.
@@ -23,7 +30,7 @@ func (m *Manager) workerLoop(id string) {
 			return
 		default:
 		}
-		t, err := m.store.Claim(m.claimCtx, id, m.types, m.cfg.LeaseTime)
+		t, err := m.store.Claim(m.claimCtx, m.claimOptions(id, m.cfg.LeaseTime))
 		switch {
 		case err == nil && t != nil:
 			m.process(id, t)
@@ -69,7 +76,7 @@ func (m *Manager) process(workerID string, t *Task) {
 	result, err := m.invoke(entry, hctx, t)
 	stopHeartbeat()
 
-	fctx, cancel := context.WithTimeout(context.WithoutCancel(m.runCtx), finalizeTimeout)
+	fctx, cancel := m.finalizeContext()
 	defer cancel()
 
 	if err != nil {
@@ -125,7 +132,7 @@ func (m *Manager) startHeartbeat(t *Task, onLost context.CancelFunc) (stop func(
 			case <-stopCh:
 				return
 			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.WithoutCancel(m.runCtx), finalizeTimeout)
+				ctx, cancel := m.finalizeContext()
 				_, err := m.store.ExtendLease(ctx, t, m.cfg.LeaseTime)
 				cancel()
 				if errors.Is(err, ErrLeaseLost) {

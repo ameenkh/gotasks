@@ -32,10 +32,14 @@ type TaskError struct {
 	Message string    `bson:"message" json:"message"`
 }
 
+// DefaultQueue is the queue tasks land in unless WithQueue says otherwise.
+const DefaultQueue = "default"
+
 // Task is one unit of work. Payload and Result are JSON; use the typed
 // Enqueue / RegisterHandler API instead of touching them directly.
 type Task struct {
 	ID          string          `json:"id"`
+	Queue       string          `json:"queue"` // logical queue name (DefaultQueue unless set)
 	Type        string          `json:"type"`
 	UniqueKey   string          `json:"unique_key,omitempty"` // dedup key: at most one pending/running task per key
 	Payload     json.RawMessage `json:"payload,omitempty"`

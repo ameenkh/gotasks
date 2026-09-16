@@ -466,3 +466,46 @@ func TestScenarioAtMostOnce(t *testing.T) {
 		t.Errorf("%d at-most-once tasks have more than 1 attempt", n)
 	}
 }
+
+// Scenario: batch mode under a continuous stream. Contract identical to
+// steady-throughput — exactly-once, everything done — but through the
+// fetcher/channel pipeline with the start-of-work handshake.
+func TestScenarioBatchMode(t *testing.T) {
+	t.Parallel()
+	sc := newScenario(t, "batchmode",
+		gotasks.WithMaxBatch(16),
+		gotasks.WithWorkers(8),
+	)
+	ctx := context.Background()
+
+	var calls callCounter
+	err := gotasks.RegisterHandler(sc.m, "work",
+		func(ctx context.Context, task *gotasks.Task, p struct{ N int64 }) (any, error) {
+			calls.hit(task.ID)
+			time.Sleep(5 * time.Millisecond) // small but real work
+			return nil, nil
+		})
+	if err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+	sc.start()
+
+	enqueued := sc.produce(5*time.Millisecond, func(i int64) {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "work", struct{ N int64 }{N: i}); err != nil {
+			t.Errorf("enqueue %d: %v", i, err)
+		}
+	})
+	sc.drain(30 * time.Second)
+
+	counts := sc.statusCounts()
+	if counts[gotasks.StatusDone] != enqueued || counts[gotasks.StatusDead] != 0 {
+		t.Errorf("counts = %+v, want done=%d dead=0", counts, enqueued)
+	}
+	tasks, total := calls.total()
+	if tasks != enqueued || total != enqueued {
+		t.Errorf("executed %d tasks / %d calls, want exactly-once for all %d", tasks, total, enqueued)
+	}
+	if n := sc.count(bson.M{"status": "done", "attempts": bson.M{"$ne": 1}}); n != 0 {
+		t.Errorf("%d done tasks have attempts != 1", n)
+	}
+}

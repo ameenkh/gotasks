@@ -71,13 +71,16 @@ func (s *fakeStore) Enqueue(_ context.Context, tasks []*Task) ([]string, error) 
 	return ids, nil
 }
 
-func (s *fakeStore) Claim(_ context.Context, workerID string, types []string, lease time.Duration) (*Task, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
+// claimOneLocked is the shared claim core; the caller must hold s.mu.
+// The fake always picks oldest-first regardless of opts.FIFO — a valid
+// choice for unsorted mode, which lets the store pick any runnable task.
+func (s *fakeStore) claimOneLocked(opts ClaimOptions, now time.Time) *Task {
 	var best *Task
 	for _, t := range s.tasks {
-		if len(types) > 0 && !slices.Contains(types, t.Type) {
+		if len(opts.Types) > 0 && !slices.Contains(opts.Types, t.Type) {
+			continue
+		}
+		if len(opts.Queues) > 0 && !slices.Contains(opts.Queues, t.Queue) {
 			continue
 		}
 		runnable := (t.Status == StatusPending && !t.RunAt.After(now)) ||
@@ -90,16 +93,44 @@ func (s *fakeStore) Claim(_ context.Context, workerID string, types []string, le
 		}
 	}
 	if best == nil {
-		return nil, ErrNoTask
+		return nil
 	}
 	s.seq++
 	best.Status = StatusRunning
 	best.Attempts++
-	best.LockedBy = workerID
+	best.LockedBy = opts.WorkerID
 	best.LeaseToken = fmt.Sprintf("lease-%d", s.seq)
-	best.LockedUntil = now.Add(lease)
+	best.LockedUntil = now.Add(opts.Lease)
 	best.UpdatedAt = now
-	return cloneTask(best), nil
+	return cloneTask(best)
+}
+
+func (s *fakeStore) Claim(_ context.Context, opts ClaimOptions) (*Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := s.claimOneLocked(opts, time.Now().UTC())
+	if t == nil {
+		return nil, ErrNoTask
+	}
+	return t, nil
+}
+
+func (s *fakeStore) ClaimBatch(_ context.Context, opts ClaimOptions, k int) ([]*Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	var out []*Task
+	for len(out) < k {
+		t := s.claimOneLocked(opts, now)
+		if t == nil {
+			break
+		}
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil, ErrNoTask
+	}
+	return out, nil
 }
 
 func (s *fakeStore) held(id, leaseToken string) *Task {
@@ -212,3 +243,23 @@ func (s *fakeStore) ReapExpired(_ context.Context) (int64, error) {
 }
 
 func (s *fakeStore) Close(context.Context) error { return nil }
+
+// callCounts tracks handler invocations per task id across goroutines.
+type callCounts struct{ m sync.Map }
+
+func (c *callCounts) hit(id string) {
+	v, _ := c.m.LoadOrStore(id, new(int32))
+	atomic.AddInt32(v.(*int32), 1)
+}
+
+// multi returns how many tasks were handled more than once.
+func (c *callCounts) multi() int {
+	n := 0
+	c.m.Range(func(_, v any) bool {
+		if atomic.LoadInt32(v.(*int32)) > 1 {
+			n++
+		}
+		return true
+	})
+	return n
+}

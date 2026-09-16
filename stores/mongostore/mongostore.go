@@ -136,6 +136,13 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 			Options: options.Index().SetUnique(true).
 				SetPartialFilterExpression(bson.M{"unique_key": bson.M{"$exists": true}}),
 		},
+		// ClaimBatch's winners-fetch looks up by the batch lease token; the
+		// partial index keeps it cheap and only covers in-flight tasks.
+		{
+			Keys: bson.D{{Key: "lease_token", Value: 1}},
+			Options: options.Index().
+				SetPartialFilterExpression(bson.M{"lease_token": bson.M{"$exists": true}}),
+		},
 	})
 	return err
 }
@@ -151,6 +158,7 @@ func (s *Store) retentionFor(taskType string) time.Duration {
 
 type taskDoc struct {
 	ID          primitive.ObjectID  `bson:"_id,omitempty"`
+	Queue       string              `bson:"queue"`
 	Type        string              `bson:"type"`
 	UniqueKey   string              `bson:"unique_key,omitempty"`
 	Payload     bson.Raw            `bson:"payload,omitempty"`
@@ -208,6 +216,7 @@ func (d *taskDoc) toTask() (*gotasks.Task, error) {
 	}
 	return &gotasks.Task{
 		ID:          d.ID.Hex(),
+		Queue:       d.Queue,
 		Type:        d.Type,
 		UniqueKey:   d.UniqueKey,
 		Payload:     payload,
@@ -243,7 +252,12 @@ func (s *Store) Enqueue(ctx context.Context, tasks []*gotasks.Task) ([]string, e
 		if err != nil {
 			return nil, err
 		}
+		queue := t.Queue
+		if queue == "" {
+			queue = gotasks.DefaultQueue
+		}
 		docs[i] = taskDoc{
+			Queue:       queue,
 			Type:        t.Type,
 			UniqueKey:   t.UniqueKey,
 			Payload:     payload,
@@ -288,13 +302,12 @@ func (s *Store) duplicateError(ctx context.Context, tasks []*gotasks.Task) error
 	return dup
 }
 
-func (s *Store) Claim(ctx context.Context, workerID string, types []string, lease time.Duration) (*gotasks.Task, error) {
-	now := time.Now().UTC()
+// runnableFilter matches tasks a claim may take: due pending tasks, or
+// stale running ones with attempts remaining. With max_attempts=1 a stale
+// task is never reclaimed (at-most-once); the reaper marks it dead instead.
+func runnableFilter(now time.Time, types, queues []string) bson.M {
 	filter := bson.M{"$or": bson.A{
 		bson.M{"status": string(gotasks.StatusPending), "run_at": bson.M{"$lte": now}},
-		// Stale reclaim: expired lease AND attempts remaining. With
-		// max_attempts=1 a stale task is never reclaimed (at-most-once);
-		// the reaper marks it dead instead.
 		bson.M{
 			"status":       string(gotasks.StatusRunning),
 			"locked_until": bson.M{"$lt": now},
@@ -304,22 +317,39 @@ func (s *Store) Claim(ctx context.Context, workerID string, types []string, leas
 	if len(types) > 0 {
 		filter["type"] = bson.M{"$in": types}
 	}
-	update := bson.M{
+	if len(queues) > 0 {
+		filter["queue"] = bson.M{"$in": queues}
+	}
+	return filter
+}
+
+func claimUpdate(now time.Time, workerID, leaseToken string, lease time.Duration) bson.M {
+	return bson.M{
 		"$set": bson.M{
 			"status":       string(gotasks.StatusRunning),
 			"locked_by":    workerID,
-			"lease_token":  uuid.NewString(),
+			"lease_token":  leaseToken,
 			"locked_until": now.Add(lease),
 			"updated_at":   now,
 		},
 		"$inc": bson.M{"attempts": 1},
 	}
-	opts := options.FindOneAndUpdate().
-		SetSort(bson.D{{Key: "run_at", Value: 1}, {Key: "_id", Value: 1}}).
-		SetReturnDocument(options.After)
+}
+
+var claimSort = bson.D{{Key: "run_at", Value: 1}, {Key: "_id", Value: 1}}
+
+func (s *Store) Claim(ctx context.Context, claim gotasks.ClaimOptions) (*gotasks.Task, error) {
+	now := time.Now().UTC()
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+	if claim.FIFO {
+		opts = opts.SetSort(claimSort)
+	}
 
 	var doc taskDoc
-	err := s.col.FindOneAndUpdate(ctx, filter, update, opts).Decode(&doc)
+	err := s.col.FindOneAndUpdate(ctx,
+		runnableFilter(now, claim.Types, claim.Queues),
+		claimUpdate(now, claim.WorkerID, uuid.NewString(), claim.Lease),
+		opts).Decode(&doc)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return nil, gotasks.ErrNoTask
 	}
@@ -327,6 +357,70 @@ func (s *Store) Claim(ctx context.Context, workerID string, types []string, leas
 		return nil, fmt.Errorf("mongostore: claim: %w", err)
 	}
 	return doc.toTask()
+}
+
+// ClaimBatch takes up to k runnable tasks in three fixed round trips:
+// find candidate ids -> guarded updateMany (the runnable filter is
+// re-applied, so ids stolen by a concurrent claimer in between are simply
+// not matched) -> fetch the docs we won by their fresh lease token. The
+// last step also makes the returned tasks exact (attempts, errors) even if
+// a candidate was claimed-failed-retried between steps.
+func (s *Store) ClaimBatch(ctx context.Context, claim gotasks.ClaimOptions, k int) ([]*gotasks.Task, error) {
+	if k < 1 {
+		return nil, fmt.Errorf("mongostore: claim batch: k must be >= 1, got %d", k)
+	}
+	now := time.Now().UTC()
+
+	findOpts := options.Find().SetLimit(int64(k)).SetProjection(bson.M{"_id": 1})
+	if claim.FIFO {
+		findOpts = findOpts.SetSort(claimSort)
+	}
+	cur, err := s.col.Find(ctx, runnableFilter(now, claim.Types, claim.Queues), findOpts)
+	if err != nil {
+		return nil, fmt.Errorf("mongostore: claim batch find: %w", err)
+	}
+	var candidates []struct {
+		ID primitive.ObjectID `bson:"_id"`
+	}
+	if err := cur.All(ctx, &candidates); err != nil {
+		return nil, fmt.Errorf("mongostore: claim batch decode: %w", err)
+	}
+	if len(candidates) == 0 {
+		return nil, gotasks.ErrNoTask
+	}
+	ids := make(bson.A, len(candidates))
+	for i, c := range candidates {
+		ids[i] = c.ID
+	}
+
+	token := uuid.NewString()
+	guard := runnableFilter(now, nil, nil) // ids are already type/queue-filtered
+	guard["_id"] = bson.M{"$in": ids}
+	res, err := s.col.UpdateMany(ctx, guard, claimUpdate(now, claim.WorkerID, token, claim.Lease))
+	if err != nil {
+		return nil, fmt.Errorf("mongostore: claim batch update: %w", err)
+	}
+	if res.ModifiedCount == 0 {
+		return nil, nil // all candidates stolen; more work may exist — retry
+	}
+
+	won, err := s.col.Find(ctx, bson.M{"lease_token": token})
+	if err != nil {
+		return nil, fmt.Errorf("mongostore: claim batch fetch: %w", err)
+	}
+	var docs []taskDoc
+	if err := won.All(ctx, &docs); err != nil {
+		return nil, fmt.Errorf("mongostore: claim batch fetch decode: %w", err)
+	}
+	tasks := make([]*gotasks.Task, 0, len(docs))
+	for i := range docs {
+		t, err := docs[i].toTask()
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, t)
+	}
+	return tasks, nil
 }
 
 // leaseFilter fences finalizing writes: only the current lease token may

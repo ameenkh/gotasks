@@ -35,6 +35,31 @@ type Config struct {
 	// heartbeat discovers the lease was lost (the task was reclaimed), the
 	// handler's context is cancelled.
 	HeartbeatInterval time.Duration
+	// MaxBatch selects the claiming architecture. 1 (default) = single
+	// mode: each worker claims tasks directly, one at a time — no fetcher,
+	// no channel, no extra round trips (the claim itself starts the task
+	// lease). 2..100 = batch mode: one fetcher goroutine claims up to
+	// MaxBatch tasks per batch under a QUEUE lease and feeds a bounded
+	// channel; a worker taking a task revalidates ownership with one
+	// ExtendLease point-write, which starts the task lease (LeaseTime).
+	// Batch mode amortizes the contended claim query and is meant for
+	// high-throughput pipelines.
+	MaxBatch int
+	// QueueLeaseTime is the lease applied at batch claim time, budgeting
+	// how long a task may wait in the fetcher's channel before it becomes
+	// reclaimable by other processes. 0 (default) uses LeaseTime. Only
+	// meaningful in batch mode.
+	QueueLeaseTime time.Duration
+	// FIFO makes claims take the oldest runnable task first ((run_at, id)
+	// ascending). Off by default: unsorted claiming is faster and spreads
+	// contention, but doesn't bound how stale a task can get under
+	// sustained overload. Scheduling (run_at) is enforced by the claim
+	// filter in both modes — FIFO only orders already-due tasks.
+	FIFO bool
+	// Queues restricts this manager to claiming from the named queues.
+	// Empty (default) serves all queues. Tasks are assigned a queue at
+	// enqueue via WithQueue (DefaultQueue otherwise).
+	Queues []string
 	// Logger receives worker/reaper diagnostics. Default slog.Default().
 	Logger *slog.Logger
 }
@@ -54,6 +79,29 @@ func WithLogger(l *slog.Logger) Option          { return func(c *Config) { c.Log
 // HeartbeatAuto selects the automatic heartbeat cadence: LeaseTime/3.
 const HeartbeatAuto time.Duration = -1
 
+// WithFIFO makes claims take the oldest runnable task first (see
+// Config.FIFO). Off by default.
+func WithFIFO() Option {
+	return func(c *Config) { c.FIFO = true }
+}
+
+// WithQueues restricts this manager to the named queues (see Config.Queues).
+func WithQueues(queues ...string) Option {
+	return func(c *Config) { c.Queues = queues }
+}
+
+// WithMaxBatch enables batch mode with up to n tasks claimed per fetch
+// (see Config.MaxBatch). n=1 keeps single mode.
+func WithMaxBatch(n int) Option {
+	return func(c *Config) { c.MaxBatch = n }
+}
+
+// WithQueueLeaseTime sets the channel-time lease budget for batch mode
+// (see Config.QueueLeaseTime).
+func WithQueueLeaseTime(d time.Duration) Option {
+	return func(c *Config) { c.QueueLeaseTime = d }
+}
+
 // WithHeartbeat enables automatic lease extension at the auto cadence
 // (LeaseTime/3). Off by default.
 func WithHeartbeat() Option {
@@ -71,6 +119,7 @@ type enqueueOptions struct {
 	delay       time.Duration
 	maxAttempts int // 0 = manager default
 	uniqueKey   string
+	queue       string // "" = DefaultQueue
 }
 
 // EnqueueOption configures a single Enqueue/EnqueueMany call.
@@ -90,6 +139,12 @@ func WithDelay(d time.Duration) EnqueueOption {
 // enqueue. Use 1 for at-most-once work (never retried, stale never reclaimed).
 func WithMaxAttempts(n int) EnqueueOption {
 	return func(o *enqueueOptions) { o.maxAttempts = n }
+}
+
+// WithQueue enqueues the task(s) into a named queue (DefaultQueue when not
+// used). Managers claim from all queues unless restricted with WithQueues.
+func WithQueue(name string) EnqueueOption {
+	return func(o *enqueueOptions) { o.queue = name }
 }
 
 // WithUniqueKey makes the enqueue idempotent: at most one pending/running

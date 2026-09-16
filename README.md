@@ -101,6 +101,41 @@ pending ──claim (atomic, +1 attempt, new lease)──▶ running ──ok─
 - Every failed attempt is appended to the task's `errors` array
   (`{at, attempt, worker, message}`).
 
+## Queues and ordering
+
+Tasks carry a queue label (`gotasks.WithQueue("emails")` at enqueue;
+`"default"` otherwise), and a manager can be dedicated to specific queues
+with `gotasks.WithQueues("emails")` — run one manager per queue (they can
+share a process and a Mongo client) to give each queue its own worker pool.
+
+Claims are **unsorted by default**: the store takes whichever runnable task
+is cheapest — faster and less contended. Scheduling is unaffected (`run_at`
+is enforced by the claim filter, never the ordering). Opt into oldest-first
+claiming with `gotasks.WithFIFO()` when task staleness must stay bounded
+under overload; note that with parallel workers, *completion* order is
+never guaranteed in any mode.
+
+## Batch mode (big pipelines)
+
+By default (`MaxBatch` = 1) each worker claims tasks directly — simple, no
+extra round trips. For high-throughput pipelines, enable batch mode:
+
+```go
+m, err := gotasks.New(store,
+    gotasks.WithWorkers(16),
+    gotasks.WithMaxBatch(32),                    // fetcher claims 32 per ~3 round trips
+    gotasks.WithQueueLeaseTime(2*time.Minute),   // channel-wait budget (default: LeaseTime)
+)
+```
+
+One fetcher per process claims batches under a **queue lease** and feeds a
+bounded channel; workers revalidate ownership with a single point-write (the
+start-of-work handshake) which starts the normal task lease. This amortizes
+the contended claim query across the batch and moves head-of-queue racing
+from per-worker to per-process. A task that waits in the channel longer than
+the queue lease is dropped locally, unrun, and reclaimed — exactly-once
+execution per attempt is preserved (see the scenario tests).
+
 ## Retention
 
 Finished tasks (done/dead) can auto-prune via a TTL index:
@@ -125,8 +160,8 @@ mongostore.New(ctx, uri,
 v0.2 (current): core queue, Mongo store, worker pool, retries/backoff,
 scheduling, reaper, heartbeat, dead-letter + requeue, unique tasks,
 per-type retention. See [PLAN.md](PLAN.md) for the full roadmap
-(cron + leader election, cancellation, batch claim, priorities,
-change-stream wakeup, Postgres store, metrics...).
+(batch claim, named queues, priorities, change-stream wakeup,
+Postgres store, metrics...).
 
 ## License
 

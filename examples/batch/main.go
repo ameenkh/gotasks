@@ -1,7 +1,9 @@
 // Batch fan-out and throughput: EnqueueMany inserts a whole batch in one
 // store round-trip (this is how broadcast-style workloads fan one message
-// out to thousands of recipients). The railway worker pool then drains the
-// queue at full speed — workers only sleep when the queue is empty.
+// out to thousands of recipients), and WithMaxBatch enables batch-mode
+// consumption: one fetcher claims up to 16 tasks per ~3 round trips and
+// feeds the workers through a bounded channel, instead of each worker
+// paying a contended claim query per task.
 package main
 
 import (
@@ -32,6 +34,7 @@ func main() {
 
 	m, err := gotasks.New(store,
 		gotasks.WithWorkers(8),
+		gotasks.WithMaxBatch(16),              // batch mode: fetcher + channel
 		gotasks.WithPollInterval(time.Second), // irrelevant while the queue is busy
 	)
 	if err != nil {

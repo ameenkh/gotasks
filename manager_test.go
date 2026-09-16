@@ -203,7 +203,7 @@ func TestStaleTaskReclaimedThenCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	dead, err := fs.Claim(ctx, "dead-worker", nil, time.Millisecond)
+	dead, err := fs.Claim(ctx, ClaimOptions{WorkerID: "dead-worker", Lease: time.Millisecond})
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestAtMostOnceStaleIsReapedNotRetried(t *testing.T) {
 		Type: "once", Status: StatusPending, MaxAttempts: 1,
 		RunAt: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}})
-	if _, err := fs.Claim(ctx, "dead-worker", nil, time.Millisecond); err != nil {
+	if _, err := fs.Claim(ctx, ClaimOptions{WorkerID: "dead-worker", Lease: time.Millisecond}); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	time.Sleep(10 * time.Millisecond)
@@ -533,5 +533,144 @@ func TestUniqueKeyRejectedForBatch(t *testing.T) {
 		[]struct{}{{}, {}}, WithUniqueKey("k"))
 	if err == nil {
 		t.Fatal("expected error for WithUniqueKey on a batch")
+	}
+}
+
+func TestBatchModeProcessesAllExactlyOnce(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs, WithMaxBatch(10), WithWorkers(4))
+
+	var calls callCounts
+	_ = RegisterHandler(m, "bulk", func(ctx context.Context, task *Task, p struct{ N int }) (any, error) {
+		calls.hit(task.ID)
+		return nil, nil
+	})
+
+	payloads := make([]struct{ N int }, 100)
+	for i := range payloads {
+		payloads[i].N = i
+	}
+	ids, err := EnqueueMany(context.Background(), m, "bulk", payloads)
+	if err != nil || len(ids) != 100 {
+		t.Fatalf("EnqueueMany: %d ids, %v", len(ids), err)
+	}
+	startManager(t, m)
+
+	for _, id := range ids {
+		task := waitForStatus(t, fs, id, StatusDone)
+		if task.Attempts != 1 {
+			t.Errorf("task %s attempts = %d, want 1", id, task.Attempts)
+		}
+	}
+	if n := calls.multi(); n != 0 {
+		t.Errorf("%d tasks handled more than once", n)
+	}
+}
+
+// A task whose queue lease expires while buffered must be dropped locally
+// (zero handler calls for that claim) and then reclaimed and completed on a
+// later fetch — never run under an expired lease and never run twice.
+func TestBatchModeQueueLeaseAgingDropsThenReclaims(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs,
+		WithMaxBatch(5),
+		WithWorkers(1),
+		WithQueueLeaseTime(20*time.Millisecond), // tiny channel budget
+		WithLeaseTime(time.Second),              // ample execution budget
+		WithDefaultMaxAttempts(20),              // aging burns attempts; keep headroom
+	)
+
+	var calls callCounts
+	_ = RegisterHandler(m, "slow", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		calls.hit(task.ID)
+		time.Sleep(60 * time.Millisecond) // 3x the queue lease: the rest of the batch ages
+		return nil, nil
+	})
+
+	ids, err := EnqueueMany(context.Background(), m, "slow", make([]struct{}, 5))
+	if err != nil {
+		t.Fatalf("EnqueueMany: %v", err)
+	}
+	startManager(t, m)
+
+	sawReclaim := false
+	for _, id := range ids {
+		task := waitForStatus(t, fs, id, StatusDone)
+		if task.Attempts > 1 {
+			sawReclaim = true
+		}
+	}
+	if !sawReclaim {
+		t.Error("no task aged in the channel — scenario did not exercise the drop path")
+	}
+	if n := calls.multi(); n != 0 {
+		t.Errorf("%d tasks handled more than once despite aging", n)
+	}
+}
+
+func TestBatchModeForeignTypesUntouched(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs, WithMaxBatch(8))
+
+	var done atomic.Int32
+	_ = RegisterHandler(m, "mine", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		done.Add(1)
+		return nil, nil
+	})
+
+	ids, _ := EnqueueMany(context.Background(), m, "mine", make([]struct{}, 10))
+	otherID, _ := Enqueue(context.Background(), m, "other-service-type", struct{}{})
+	startManager(t, m)
+
+	for _, id := range ids {
+		waitForStatus(t, fs, id, StatusDone)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if task := fs.get(otherID); task.Status != StatusPending || task.Attempts != 0 {
+		t.Errorf("foreign task touched by batch fetcher: %+v", task)
+	}
+}
+
+func TestMaxBatchValidation(t *testing.T) {
+	if _, err := New(newFakeStore(), WithMaxBatch(0)); err == nil {
+		t.Error("MaxBatch 0 accepted")
+	}
+	if _, err := New(newFakeStore(), WithMaxBatch(101)); err == nil {
+		t.Error("MaxBatch 101 accepted")
+	}
+	if _, err := New(newFakeStore(), WithQueueLeaseTime(-time.Second)); err == nil {
+		t.Error("negative QueueLeaseTime accepted")
+	}
+}
+
+func TestManagerServesOnlyItsQueues(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs, WithQueues("emails"))
+
+	var done atomic.Int32
+	_ = RegisterHandler(m, "send", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		done.Add(1)
+		return nil, nil
+	})
+
+	ctx := context.Background()
+	emailID, _ := Enqueue(ctx, m, "send", struct{}{}, WithQueue("emails"))
+	reportID, _ := Enqueue(ctx, m, "send", struct{}{}, WithQueue("reports"))
+	defaultID, _ := Enqueue(ctx, m, "send", struct{}{}) // DefaultQueue
+	startManager(t, m)
+
+	waitForStatus(t, fs, emailID, StatusDone)
+	time.Sleep(30 * time.Millisecond)
+	if task := fs.get(reportID); task.Status != StatusPending {
+		t.Errorf("reports-queue task claimed by emails manager: %+v", task)
+	}
+	if task := fs.get(defaultID); task.Status != StatusPending {
+		t.Errorf("default-queue task claimed by emails manager: %+v", task)
+	}
+	if task := fs.get(defaultID); task.Queue != DefaultQueue {
+		t.Errorf("queue not defaulted: %q", task.Queue)
+	}
+	if done.Load() != 1 {
+		t.Errorf("handled %d tasks, want 1", done.Load())
 	}
 }

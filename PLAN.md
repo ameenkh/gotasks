@@ -73,10 +73,6 @@ Module: `github.com/ameenkh/gotasks`
 - [x] Unique/idempotent tasks: `WithUniqueKey` + partial unique index; key
       held while pending/running (kept across retries), released at done/dead;
       conflict returns existing id + ErrDuplicateTask
-- [ ] Recurring/cron tasks + leader election via internal lease (golocks
-      idea) — deferred, to discuss
-- [ ] `Cancel(id)` for pending; cooperative cancel for running — deferred,
-      to discuss
 - [x] Per-type retention: `WithRetentionByType` overrides the default
       retention per task type (0 = keep that type forever); reaper applies it
       via a `$switch` pipeline expression
@@ -91,12 +87,65 @@ Module: `github.com/ameenkh/gotasks`
 
 ## v0.3 — Big-pipeline scale
 
-- [ ] Batch claim (claim K per round trip; fetcher feeding worker channel)
-- [ ] Named queues, per-queue pools
+- [x] Batch claim — implemented 2026-09-16. Mode is selected by MaxBatch:
+      1 (default) = single mode, workers claim directly exactly as v0.2
+      (no fetcher, no channel, no handshake RTT); 2..100 = batch mode via
+      WithMaxBatch. Store gains ClaimBatch (find candidate ids → guarded
+      updateMany → fetch winners by batch lease token; 3 fixed RTTs, always
+      returns exact docs; partial index on lease_token keeps step 3 cheap).
+      Spec as designed (two-lease model):
+      - Two lease durations: the batch claim takes a QUEUE lease
+        (WithQueueLeaseTime, default = LeaseTime) covering time buffered in
+        the channel; the TASK lease (LeaseTime) only starts when a worker
+        begins execution.
+      - Adaptive K: `K = min(MaxBatch, free channel slots)` — never fetch
+        more than the pool can absorb soon (MaxBatch default ~32, hard cap
+        ~100 to bound crash blast-radius). Keeps channel wait ≈ one handler
+        duration, so the default queue lease holds.
+      - Continuous top-up, not drain-then-refill: the bounded channel IS the
+        backpressure. The fetcher refills whenever free slots ≥ a low-water
+        mark (≈ half capacity) so fetch I/O overlaps handler compute and
+        workers never bubble on an empty channel; full batch → refetch
+        immediately (railway), empty → sleep PollInterval / wait for the
+        change-stream nudge (#21). One claim in flight per fetcher —
+        parallel batch claims from one process would only contend with
+        themselves.
+- [x] Unsorted claiming by default + `WithFIFO()` — decided and implemented
+      2026-09-16 (revives v0.1's IsFIFO idea). The sort was never needed
+      for correctness (run_at is enforced by the claim filter), cost a
+      SORT_MERGE across the $or branches, and concentrated all claimers on
+      the head doc. WithFIFO restores oldest-first CLAIM order for both
+      single and batch claims (parallel completion order is never
+      guaranteed by any mode); choose it when task staleness must be
+      bounded under overload. Claim/ClaimBatch now take a ClaimOptions
+      struct (worker id, types, queues, FIFO, lease).
+- [x] Named queues, phase 1 of two ("field only", decided 2026-09-16):
+      tasks carry a `queue` field (DefaultQueue unless WithQueue), and a
+      manager claims only from its WithQueues set (empty = all). One
+      pipeline per manager; per-queue pools today = one manager per queue
+      (same process, shared client via FromClient). Phase 2 (below) will
+      internalize N pipelines in one manager.
+      - Start-of-work handshake at dequeue: if the in-memory locked_until
+        already passed → drop locally, no RTT, zero side effects (a
+        reclaimer owns it, or the reaper will surface it). Otherwise one
+        ExtendLease(task lease): success → we provably own it, run;
+        ErrLeaseLost → drop silently; network error → retry once, then
+        drop (dropping is always safe). No margin heuristic, no fetcher
+        channel-heartbeat, and the in-memory task is immutable after claim.
+      - Cost note: the handshake is one uncontended point-write per task on
+        the worker's timeline; the contended sorted claim stays amortized at
+        ~2 RTTs per batch. A margin-mode opt-out knob can come later for
+        sub-ms handler fleets if ever needed.
+      - Token fencing on finalize stays the last resort, unchanged.
+      - Residual duplicate-execution window = process freeze after the
+        handshake, inherent to leases; documented as "effectively
+        at-least-once, make handlers idempotent".
+- [ ] Named queues phase 2: per-queue pools inside one manager (one
+      fetcher/channel/worker-set per configured queue), plus a
+      (queue, status, run_at, _id) index when queue-filtered claiming
+      becomes the norm
 - [ ] Priorities in the claim sort
 - [ ] Change-stream wakeup (replica sets), polling fallback
-- [ ] Per-type concurrency limits and rate limiting
-- [ ] Pause/resume queues
 - [ ] Chunked mega-batch enqueue with partial-failure reporting
 
 ## v1.0 — Ecosystem
@@ -108,6 +157,25 @@ Module: `github.com/ameenkh/gotasks`
       a public package
 - [ ] Benchmarks, chaos test (kill workers mid-task; assert no loss/dup)
 - [ ] Docs site, CI, semver releases
+
+## Nice to have (not planned — review on demand)
+
+- **Recurring/cron tasks**: discussed 2026-09-15, parked. If revisited, the
+  preferred design is leaderless: every node schedules, and a `cron_runs`
+  ledger collection with a unique `(name, tick)` index + TTL makes exactly
+  one node win each occurrence — no leader election, no failover gap. (Task
+  unique keys can't serve as the dedup: they're released at done/dead, so a
+  lagging node could re-enqueue a finished occurrence.) Open choices:
+  robfig/cron parser vs interval-only syntax; skip vs backfill missed ticks.
+- **Pause/resume queues**: parked 2026-09-15 (same shape as cancellation: a
+  flag the claim path respects). If revisited: a per-queue/per-type flag
+  document that the claim filter checks — paused types simply stop matching.
+- **Cancellation**: discussed 2026-09-15, parked. Pending-task cancel is a
+  one-line status flip to a new terminal `canceled` status. Running-task
+  cancel is cooperative; preferred delivery is piggybacking the heartbeat's
+  existing round trip on a `cancel_requested` flag (zero extra load, but
+  requires heartbeat enabled). A cancelled handler should finalize as
+  `canceled`, not consume a retry attempt (distinguish via context.Cause).
 
 ## v2+ (deferred)
 

@@ -39,6 +39,24 @@ func (e *DuplicateTaskError) Error() string {
 
 func (e *DuplicateTaskError) Is(target error) bool { return target == ErrDuplicateTask }
 
+// ClaimOptions parameterizes Claim and ClaimBatch.
+type ClaimOptions struct {
+	// WorkerID is recorded on the task as locked_by.
+	WorkerID string
+	// Types restricts claims to these task types; empty = all types.
+	Types []string
+	// Queues restricts claims to these queues; empty = all queues.
+	Queues []string
+	// FIFO requests oldest-first claim order ((run_at, id) ascending).
+	// False (the default) lets the store pick whichever runnable task is
+	// cheapest to take — faster and less contended, but task staleness is
+	// unbounded under sustained overload.
+	FIFO bool
+	// Lease is how long the claim holds the task before it becomes
+	// reclaimable.
+	Lease time.Duration
+}
+
 // Store is the persistence backend. Implementations must make Claim atomic:
 // under concurrent claims, each runnable task is handed to exactly one caller.
 //
@@ -61,9 +79,16 @@ type Store interface {
 	// Status=running, Attempts incremented, and a fresh LeaseToken/LockedUntil.
 	// Runnable means: (pending AND run_at <= now) OR
 	// (running AND locked_until < now AND attempts < max_attempts).
-	// If types is non-empty, only tasks of those types are considered.
-	// Selection order is (run_at, id) ascending. Returns ErrNoTask when empty.
-	Claim(ctx context.Context, workerID string, types []string, lease time.Duration) (*Task, error)
+	// Returns ErrNoTask when nothing matches.
+	Claim(ctx context.Context, opts ClaimOptions) (*Task, error)
+
+	// ClaimBatch atomically takes up to k runnable tasks (same runnable
+	// definition and ordering as Claim) under a single lease token, in a
+	// constant number of round trips. Concurrent callers may split the
+	// candidates: a short (even empty) result with a nil error means others
+	// won some or all of them — more work may still exist, so callers should
+	// retry promptly. ErrNoTask means no runnable candidates existed at all.
+	ClaimBatch(ctx context.Context, opts ClaimOptions, k int) ([]*Task, error)
 
 	// Complete marks t done, stores the handler result (nil = none), and
 	// releases t's unique key if it has one.
