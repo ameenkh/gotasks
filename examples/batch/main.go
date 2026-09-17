@@ -34,7 +34,7 @@ func main() {
 
 	m, err := gotasks.New(store,
 		gotasks.WithWorkers(8),
-		gotasks.WithMaxBatch(16),              // batch mode: fetcher + channel
+		gotasks.WithPipelineMode(gotasks.PipelineConfig{ClaimBatch: 16}), // pipeline mode
 		gotasks.WithPollInterval(time.Second), // irrelevant while the queue is busy
 	)
 	if err != nil {

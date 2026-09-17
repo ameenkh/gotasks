@@ -35,35 +35,12 @@ type Config struct {
 	// heartbeat discovers the lease was lost (the task was reclaimed), the
 	// handler's context is cancelled.
 	HeartbeatInterval time.Duration
-	// MaxBatch selects the claiming architecture. 1 (default) = single
-	// mode: each worker claims tasks directly, one at a time — no fetcher,
-	// no channel, no extra round trips (the claim itself starts the task
-	// lease). 2..100 = batch mode: one fetcher goroutine claims up to
-	// MaxBatch tasks per batch under a QUEUE lease and feeds a bounded
-	// channel; a worker taking a task revalidates ownership with one
-	// ExtendLease point-write, which starts the task lease (LeaseTime).
-	// Batch mode amortizes the contended claim query and is meant for
-	// high-throughput pipelines.
-	MaxBatch int
-	// QueueLeaseTime is the lease applied at batch claim time, budgeting
-	// how long a task may wait in the fetcher's channel before it becomes
-	// reclaimable by other processes. 0 (default) uses LeaseTime. Only
-	// meaningful in batch mode.
-	QueueLeaseTime time.Duration
-	// FinalizeBatchSize enables batched finalization when > 1: finished
-	// tasks' Complete/Fail writes are buffered per process and flushed as
-	// one bulk write. 0/1 (default) finalizes immediately. Outcomes are
-	// NEVER buffered when risky: at-most-once tasks (max_attempts=1) and
-	// tasks whose remaining lease is under the safety margin
-	// (max(4x FinalizeInterval, 2s)) take the immediate path, so a buffered
-	// outcome cannot outlive its lease while the process is alive. The
-	// trade-off: a crash loses up to FinalizeInterval of finished-but-
-	// unflushed outcomes — those tasks are reclaimed and re-run (the normal
-	// at-least-once contract, slightly widened).
-	FinalizeBatchSize int
-	// FinalizeInterval is the longest an outcome may wait in the finalize
-	// buffer (default 50ms when batching is enabled).
-	FinalizeInterval time.Duration
+	// Pipeline enables pipeline mode when non-nil (set via
+	// WithPipelineMode). nil (default) = single mode: each worker claims,
+	// handles, and writes its result independently — no fetcher, no
+	// channel, no buffering, immediate visibility of every state change.
+	// See PipelineConfig for what pipeline mode changes.
+	Pipeline *PipelineConfig
 	// DisableChangeStream forces polling even when the store supports
 	// change-stream wakeup. Default false: the manager tries the stream at
 	// Start and falls back to polling silently if unavailable.
@@ -101,16 +78,6 @@ func WithLogger(l *slog.Logger) Option          { return func(c *Config) { c.Log
 // HeartbeatAuto selects the automatic heartbeat cadence: LeaseTime/3.
 const HeartbeatAuto time.Duration = -1
 
-// WithFinalizeBatch enables batched finalization: up to size outcomes are
-// buffered and flushed as one bulk write, at most interval after the first
-// entered the buffer (see Config.FinalizeBatchSize for the safety policy).
-func WithFinalizeBatch(size int, interval time.Duration) Option {
-	return func(c *Config) {
-		c.FinalizeBatchSize = size
-		c.FinalizeInterval = interval
-	}
-}
-
 // WithoutChangeStream forces polling even when the store supports
 // change-stream wakeup (see Config.DisableChangeStream).
 func WithoutChangeStream() Option {
@@ -134,16 +101,49 @@ func WithQueues(queues ...string) Option {
 	return func(c *Config) { c.Queues = queues }
 }
 
-// WithMaxBatch enables batch mode with up to n tasks claimed per fetch
-// (see Config.MaxBatch). n=1 keeps single mode.
-func WithMaxBatch(n int) Option {
-	return func(c *Config) { c.MaxBatch = n }
+// PipelineConfig configures pipeline mode: the high-throughput
+// architecture where one fetcher claims tasks in batches under a QUEUE
+// lease and feeds workers through a bounded channel (workers revalidate
+// ownership with one point-write that starts the task lease), and finished
+// tasks are acknowledged in batched bulk writes.
+//
+// Zero values take defaults, so WithPipelineMode(PipelineConfig{}) is a
+// complete, sensible setup.
+//
+// Finalize safety policy: outcomes are NEVER buffered when risky —
+// at-most-once tasks (max_attempts=1) and tasks whose remaining lease is
+// under the safety margin (max(4x FinalizeInterval, 2s)) are written
+// immediately, so a buffered outcome cannot outlive its lease while the
+// process is alive. The trade-off: a crash loses up to FinalizeInterval of
+// finished-but-unflushed outcomes — those tasks are reclaimed and re-run
+// (the normal at-least-once contract, slightly widened).
+type PipelineConfig struct {
+	// ClaimBatch is how many tasks the fetcher claims per round trip
+	// (1..100). Default 32.
+	ClaimBatch int
+	// QueueLease budgets how long a task may wait in the fetcher's channel
+	// before becoming reclaimable by other processes. Default: LeaseTime.
+	QueueLease time.Duration
+	// FinalizeBatch is how many outcomes a finalize flush carries at most
+	// (2..1000). Default: 2x ClaimBatch.
+	FinalizeBatch int
+	// FinalizeInterval is the longest a finished task may wait in the
+	// finalize buffer before its outcome is written (default 300ms). A
+	// latency bound, not a polling period: the flusher sleeps while the
+	// buffer is empty, and on busy queues the size trigger fires first.
+	FinalizeInterval time.Duration
+	// NoFinalize keeps batched claiming but writes every outcome
+	// immediately (single-mode acknowledgment semantics).
+	NoFinalize bool
 }
 
-// WithQueueLeaseTime sets the channel-time lease budget for batch mode
-// (see Config.QueueLeaseTime).
-func WithQueueLeaseTime(d time.Duration) Option {
-	return func(c *Config) { c.QueueLeaseTime = d }
+// WithPipelineMode switches the manager from single mode to pipeline mode
+// (see PipelineConfig). Single mode — the default — keeps every worker
+// claiming, handling, and acknowledging independently with immediate
+// visibility; pipeline mode trades bounded acknowledgment latency for
+// amortized round trips and is meant for high-throughput pipelines.
+func WithPipelineMode(pc PipelineConfig) Option {
+	return func(c *Config) { c.Pipeline = &pc }
 }
 
 // WithHeartbeat enables automatic lease extension at the auto cadence

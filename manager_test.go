@@ -538,7 +538,7 @@ func TestUniqueKeyRejectedForBatch(t *testing.T) {
 
 func TestBatchModeProcessesAllExactlyOnce(t *testing.T) {
 	fs := newFakeStore()
-	m := testManager(t, fs, WithMaxBatch(10), WithWorkers(4))
+	m := testManager(t, fs, WithPipelineMode(PipelineConfig{ClaimBatch: 10}), WithWorkers(4))
 
 	var calls callCounts
 	_ = RegisterHandler(m, "bulk", func(ctx context.Context, task *Task, p struct{ N int }) (any, error) {
@@ -573,11 +573,14 @@ func TestBatchModeProcessesAllExactlyOnce(t *testing.T) {
 func TestBatchModeQueueLeaseAgingDropsThenReclaims(t *testing.T) {
 	fs := newFakeStore()
 	m := testManager(t, fs,
-		WithMaxBatch(5),
+		WithPipelineMode(PipelineConfig{
+			ClaimBatch: 5,
+			QueueLease: 20 * time.Millisecond, // tiny channel budget
+			NoFinalize: true,
+		}),
 		WithWorkers(1),
-		WithQueueLeaseTime(20*time.Millisecond), // tiny channel budget
-		WithLeaseTime(time.Second),              // ample execution budget
-		WithDefaultMaxAttempts(20),              // aging burns attempts; keep headroom
+		WithLeaseTime(time.Second),  // ample execution budget
+		WithDefaultMaxAttempts(20),  // aging burns attempts; keep headroom
 	)
 
 	var calls callCounts
@@ -610,7 +613,7 @@ func TestBatchModeQueueLeaseAgingDropsThenReclaims(t *testing.T) {
 
 func TestBatchModeForeignTypesUntouched(t *testing.T) {
 	fs := newFakeStore()
-	m := testManager(t, fs, WithMaxBatch(8))
+	m := testManager(t, fs, WithPipelineMode(PipelineConfig{ClaimBatch: 8}))
 
 	var done atomic.Int32
 	_ = RegisterHandler(m, "mine", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
@@ -631,15 +634,18 @@ func TestBatchModeForeignTypesUntouched(t *testing.T) {
 	}
 }
 
-func TestMaxBatchValidation(t *testing.T) {
-	if _, err := New(newFakeStore(), WithMaxBatch(0)); err == nil {
-		t.Error("MaxBatch 0 accepted")
+func TestPipelineValidation(t *testing.T) {
+	if _, err := New(newFakeStore(), WithPipelineMode(PipelineConfig{})); err != nil {
+		t.Errorf("zero-value PipelineConfig must be valid: %v", err)
 	}
-	if _, err := New(newFakeStore(), WithMaxBatch(101)); err == nil {
-		t.Error("MaxBatch 101 accepted")
+	if _, err := New(newFakeStore(), WithPipelineMode(PipelineConfig{ClaimBatch: 101})); err == nil {
+		t.Error("ClaimBatch 101 accepted")
 	}
-	if _, err := New(newFakeStore(), WithQueueLeaseTime(-time.Second)); err == nil {
-		t.Error("negative QueueLeaseTime accepted")
+	if _, err := New(newFakeStore(), WithPipelineMode(PipelineConfig{QueueLease: -time.Second})); err == nil {
+		t.Error("negative QueueLease accepted")
+	}
+	if _, err := New(newFakeStore(), WithPipelineMode(PipelineConfig{FinalizeBatch: 1001})); err == nil {
+		t.Error("FinalizeBatch 1001 accepted")
 	}
 }
 
@@ -694,7 +700,7 @@ func TestChangeStreamNudgeWakesWorkers(t *testing.T) {
 		opts []Option
 	}{
 		{"single", nil},
-		{"batch", []Option{WithMaxBatch(4)}},
+		{"pipeline", []Option{WithPipelineMode(PipelineConfig{ClaimBatch: 4})}},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
 			ws := &watchingFakeStore{fakeStore: newFakeStore(), watch: make(chan struct{}, 1)}
@@ -744,7 +750,7 @@ func TestFinalizeBatchFlushBySize(t *testing.T) {
 	// Huge interval: only the size trigger (3) can explain a prompt flush.
 	m := testManager(t, fs,
 		WithLeaseTime(time.Minute),
-		WithFinalizeBatch(3, 10*time.Minute),
+		WithPipelineMode(PipelineConfig{ClaimBatch: 4, FinalizeBatch: 3, FinalizeInterval: 2 * time.Second}),
 		WithWorkers(2))
 
 	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
@@ -765,7 +771,7 @@ func TestFinalizeBatchFlushByInterval(t *testing.T) {
 	fs := newFakeStore()
 	m := testManager(t, fs,
 		WithLeaseTime(time.Minute),
-		WithFinalizeBatch(1000, 120*time.Millisecond), // size can't trigger
+		WithPipelineMode(PipelineConfig{ClaimBatch: 4, FinalizeBatch: 1000, FinalizeInterval: 120 * time.Millisecond}), // size can't trigger
 		WithWorkers(1))
 
 	ran := make(chan struct{})
@@ -790,7 +796,7 @@ func TestFinalizeBatchAtMostOnceBypasses(t *testing.T) {
 	// Interval so long that only the bypass can finish the task quickly.
 	m := testManager(t, fs,
 		WithLeaseTime(time.Minute),
-		WithFinalizeBatch(1000, 10*time.Minute))
+		WithPipelineMode(PipelineConfig{FinalizeBatch: 1000, FinalizeInterval: 10 * time.Second}))
 
 	_ = RegisterHandler(m, "once", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
 		return nil, nil
@@ -805,7 +811,7 @@ func TestFinalizeBatchLeaseMarginBypasses(t *testing.T) {
 	// LeaseTime 1s < margin (2s): every outcome bypasses the buffer.
 	m := testManager(t, fs,
 		WithLeaseTime(time.Second),
-		WithFinalizeBatch(1000, 10*time.Minute))
+		WithPipelineMode(PipelineConfig{FinalizeBatch: 1000, FinalizeInterval: 10 * time.Second}))
 
 	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
 		return nil, nil
@@ -819,7 +825,7 @@ func TestFinalizeBatchDrainsOnStop(t *testing.T) {
 	fs := newFakeStore()
 	m := testManager(t, fs,
 		WithLeaseTime(time.Minute),
-		WithFinalizeBatch(1000, 10*time.Minute), // neither size nor interval will fire
+		WithPipelineMode(PipelineConfig{FinalizeBatch: 1000, FinalizeInterval: 10 * time.Second}), // neither size nor interval fires before Stop
 		WithWorkers(2))
 
 	var ran atomic.Int32
@@ -851,7 +857,7 @@ func TestFinalizeBatchFailuresRetryAndDie(t *testing.T) {
 	fs := newFakeStore()
 	m := testManager(t, fs,
 		WithLeaseTime(time.Minute),
-		WithFinalizeBatch(2, 30*time.Millisecond))
+		WithPipelineMode(PipelineConfig{FinalizeBatch: 2, FinalizeInterval: 30 * time.Millisecond}))
 
 	var calls atomic.Int32
 	_ = RegisterHandler(m, "flaky", func(ctx context.Context, task *Task, _ struct{}) (any, error) {

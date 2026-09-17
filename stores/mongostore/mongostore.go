@@ -30,6 +30,7 @@ type config struct {
 	collection      string
 	retention       time.Duration
 	retentionByType map[string]time.Duration
+	enqueueChunk    int
 	ping            bool
 }
 
@@ -54,6 +55,11 @@ func WithRetentionByType(byType map[string]time.Duration) Option {
 	return func(c *config) { c.retentionByType = byType }
 }
 
+// WithEnqueueChunkSize sets how many tasks a single batch-enqueue insert
+// carries (default 1000). Bigger batches are written chunk by chunk, so a
+// 100k fan-out neither builds one giant wire message nor fails opaquely.
+func WithEnqueueChunkSize(n int) Option { return func(c *config) { c.enqueueChunk = n } }
+
 // WithPing controls the connectivity check in New (default true).
 func WithPing(ping bool) Option { return func(c *config) { c.ping = ping } }
 
@@ -63,6 +69,7 @@ type Store struct {
 	col             *mongo.Collection
 	retention       time.Duration
 	retentionByType map[string]time.Duration
+	enqueueChunk    int
 	ownsClient      bool
 }
 
@@ -97,7 +104,7 @@ func FromClient(ctx context.Context, client *mongo.Client, opts ...Option) (*Sto
 }
 
 func defaults(opts []Option) config {
-	cfg := config{database: "gotasks", collection: "tasks", ping: true}
+	cfg := config{database: "gotasks", collection: "tasks", enqueueChunk: 1000, ping: true}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -105,11 +112,15 @@ func defaults(opts []Option) config {
 }
 
 func build(ctx context.Context, client *mongo.Client, cfg config) (*Store, error) {
+	if cfg.enqueueChunk < 1 || cfg.enqueueChunk > 10000 {
+		return nil, fmt.Errorf("mongostore: enqueue chunk size must be 1..10000, got %d", cfg.enqueueChunk)
+	}
 	s := &Store{
 		client:          client,
 		col:             client.Database(cfg.database).Collection(cfg.collection),
 		retention:       cfg.retention,
 		retentionByType: cfg.retentionByType,
+		enqueueChunk:    cfg.enqueueChunk,
 	}
 	if err := s.ensureIndexes(ctx); err != nil {
 		return nil, fmt.Errorf("mongostore: ensure indexes: %w", err)
@@ -242,11 +253,17 @@ func oid(id string) (primitive.ObjectID, error) {
 	return o, nil
 }
 
+// Enqueue inserts tasks in chunks of enqueueChunk. Ids are generated
+// client-side upfront, so the returned slice is always aligned with the
+// input; failed entries are reported per index via *PartialEnqueueError
+// with "" left at their positions (a single-task unique-key conflict keeps
+// the *DuplicateTaskError contract).
 func (s *Store) Enqueue(ctx context.Context, tasks []*gotasks.Task) ([]string, error) {
 	if len(tasks) == 0 {
 		return nil, nil
 	}
 	docs := make([]any, len(tasks))
+	ids := make([]string, len(tasks))
 	for i, t := range tasks {
 		payload, err := jsonToRaw(t.Payload)
 		if err != nil {
@@ -256,7 +273,10 @@ func (s *Store) Enqueue(ctx context.Context, tasks []*gotasks.Task) ([]string, e
 		if queue == "" {
 			queue = gotasks.DefaultQueue
 		}
+		id := primitive.NewObjectID()
+		ids[i] = id.Hex()
 		docs[i] = taskDoc{
+			ID:          id,
 			Queue:       queue,
 			Type:        t.Type,
 			UniqueKey:   t.UniqueKey,
@@ -269,18 +289,51 @@ func (s *Store) Enqueue(ctx context.Context, tasks []*gotasks.Task) ([]string, e
 			UpdatedAt:   t.UpdatedAt.UTC(),
 		}
 	}
-	res, err := s.col.InsertMany(ctx, docs, options.InsertMany().SetOrdered(false))
-	if err != nil {
-		if mongo.IsDuplicateKeyError(err) {
-			return nil, s.duplicateError(ctx, tasks)
+
+	var failures []gotasks.EnqueueFailure
+	failChunk := func(start, end int, cause error) {
+		for i := start; i < end; i++ {
+			ids[i] = ""
+			failures = append(failures, gotasks.EnqueueFailure{Index: i, Err: cause})
 		}
-		return nil, fmt.Errorf("mongostore: enqueue: %w", err)
 	}
-	ids := make([]string, len(res.InsertedIDs))
-	for i, id := range res.InsertedIDs {
-		ids[i] = id.(primitive.ObjectID).Hex()
+	for start := 0; start < len(docs); start += s.enqueueChunk {
+		end := min(start+s.enqueueChunk, len(docs))
+		_, err := s.col.InsertMany(ctx, docs[start:end], options.InsertMany().SetOrdered(false))
+		if err == nil {
+			continue
+		}
+		var bwe mongo.BulkWriteException
+		if errors.As(err, &bwe) && len(bwe.WriteErrors) > 0 {
+			// Per-entry failures (e.g. unique-key conflicts); the rest of
+			// the unordered chunk was inserted.
+			for _, we := range bwe.WriteErrors {
+				gi := start + we.Index
+				ids[gi] = ""
+				cause := fmt.Errorf("mongostore: enqueue: %s", we.Message)
+				if we.Code == 11000 { // duplicate key
+					cause = fmt.Errorf("%w: %s", gotasks.ErrDuplicateTask, we.Message)
+				}
+				failures = append(failures, gotasks.EnqueueFailure{Index: gi, Err: cause})
+			}
+			continue
+		}
+		// Hard error (network, context): this chunk's fate is unknown and
+		// later chunks were never attempted — report them all and stop.
+		cause := fmt.Errorf("mongostore: enqueue: %w", err)
+		failChunk(start, len(docs), cause)
+		break
 	}
-	return ids, nil
+
+	if len(failures) == 0 {
+		return ids, nil
+	}
+	// Single-task unique-key conflict keeps the richer DuplicateTaskError
+	// contract (existing holder's id looked up).
+	if len(tasks) == 1 && errors.Is(failures[0].Err, gotasks.ErrDuplicateTask) {
+		return nil, s.duplicateError(ctx, tasks)
+	}
+	return ids, &gotasks.PartialEnqueueError{Failures: failures}
 }
 
 // duplicateError builds a *gotasks.DuplicateTaskError for a unique-key

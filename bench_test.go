@@ -131,25 +131,36 @@ func BenchmarkThroughputSingleMode16Workers(b *testing.B) {
 	benchThroughput(b, gotasks.WithWorkers(16))
 }
 
-func BenchmarkThroughputBatch16x8Workers(b *testing.B) {
-	benchThroughput(b, gotasks.WithWorkers(8), gotasks.WithMaxBatch(16))
+func BenchmarkThroughputPipeline16x8NoFinalize(b *testing.B) {
+	benchThroughput(b, gotasks.WithWorkers(8),
+		gotasks.WithPipelineMode(gotasks.PipelineConfig{ClaimBatch: 16, NoFinalize: true}))
 }
 
-func BenchmarkThroughputBatch64x16Workers(b *testing.B) {
-	benchThroughput(b, gotasks.WithWorkers(16), gotasks.WithMaxBatch(64))
+func BenchmarkThroughputPipeline16x8Workers(b *testing.B) {
+	benchThroughput(b, gotasks.WithWorkers(8),
+		gotasks.WithPipelineMode(gotasks.PipelineConfig{ClaimBatch: 16, FinalizeInterval: 25 * time.Millisecond}))
 }
 
-func BenchmarkThroughputSingle16WorkersFin64(b *testing.B) {
+func BenchmarkThroughputPipeline64x16Workers(b *testing.B) {
 	benchThroughput(b, gotasks.WithWorkers(16),
-		gotasks.WithFinalizeBatch(64, 25*time.Millisecond))
+		gotasks.WithPipelineMode(gotasks.PipelineConfig{ClaimBatch: 64, FinalizeInterval: 25 * time.Millisecond}))
 }
 
-func BenchmarkThroughputBatch16x8WorkersFin64(b *testing.B) {
-	benchThroughput(b, gotasks.WithWorkers(8), gotasks.WithMaxBatch(16),
-		gotasks.WithFinalizeBatch(64, 25*time.Millisecond))
-}
 
-func BenchmarkThroughputBatch64x16WorkersFin128(b *testing.B) {
-	benchThroughput(b, gotasks.WithWorkers(16), gotasks.WithMaxBatch(64),
-		gotasks.WithFinalizeBatch(128, 25*time.Millisecond))
+
+func BenchmarkEnqueueMany10k(b *testing.B) {
+	st := benchStore(b)
+	m, err := gotasks.New(st)
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx := context.Background()
+	batch := make([]struct{ N int }, 10000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := gotasks.EnqueueMany(ctx, m, "bench", batch); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(float64(b.N*10000)/b.Elapsed().Seconds(), "tasks/sec")
 }

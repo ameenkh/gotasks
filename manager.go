@@ -34,8 +34,8 @@ type Manager struct {
 	claimCancel context.CancelFunc
 	wg          sync.WaitGroup
 
-	// Batch mode (MaxBatch > 1) only: the fetcher fills taskCh, workers
-	// drain it and nudge the fetcher after each take.
+	// Pipeline mode only: the fetcher fills taskCh, workers drain it and
+	// nudge the fetcher after each take.
 	taskCh     chan *Task
 	fetchNudge chan struct{}
 
@@ -46,9 +46,10 @@ type Manager struct {
 	watchCh <-chan struct{}
 	wake    *broadcaster
 
-	// Batched finalization (FinalizeBatchSize > 1): workers buffer
-	// outcomes; the flusher writes them as one bulkWrite. workerWg tracks
-	// worker goroutines only, so the flusher can outlive them and drain.
+	// Batched finalization (pipeline mode, unless NoFinalize): workers
+	// buffer outcomes; the flusher writes them as one bulkWrite. workerWg
+	// tracks worker goroutines only, so the flusher can outlive them and
+	// drain.
 	finMu       sync.Mutex
 	finBuf      []Outcome
 	finOldest   time.Time // when the oldest buffered outcome entered
@@ -94,7 +95,6 @@ func New(store Store, opts ...Option) (*Manager, error) {
 		DefaultTimeout:     60 * time.Second,
 		Backoff:            ExponentialBackoff(30*time.Second, time.Hour),
 		ReapInterval:       60 * time.Second,
-		MaxBatch:           1,
 		FallbackPoll:       30 * time.Second,
 	}
 	for _, o := range opts {
@@ -115,24 +115,37 @@ func New(store Store, opts ...Option) (*Manager, error) {
 	if cfg.Backoff == nil {
 		return nil, errors.New("gotasks: Backoff must not be nil")
 	}
-	if cfg.MaxBatch < 1 || cfg.MaxBatch > 100 {
-		return nil, errors.New("gotasks: MaxBatch must be between 1 and 100")
-	}
-	if cfg.QueueLeaseTime < 0 {
-		return nil, errors.New("gotasks: QueueLeaseTime must be >= 0")
-	}
 	if cfg.FallbackPoll <= 0 {
 		return nil, errors.New("gotasks: FallbackPoll must be > 0")
 	}
-	if cfg.FinalizeBatchSize < 0 || cfg.FinalizeBatchSize > 1000 {
-		return nil, errors.New("gotasks: FinalizeBatchSize must be between 0 and 1000")
-	}
-	if cfg.FinalizeBatchSize > 1 {
-		if cfg.FinalizeInterval < 0 {
-			return nil, errors.New("gotasks: FinalizeInterval must be >= 0")
+	if p := cfg.Pipeline; p != nil {
+		// Resolve pipeline defaults in place; the rest of the manager reads
+		// the resolved values.
+		if p.ClaimBatch == 0 {
+			p.ClaimBatch = 32
 		}
-		if cfg.FinalizeInterval == 0 {
-			cfg.FinalizeInterval = 50 * time.Millisecond
+		if p.ClaimBatch < 1 || p.ClaimBatch > 100 {
+			return nil, errors.New("gotasks: Pipeline.ClaimBatch must be between 1 and 100")
+		}
+		if p.QueueLease < 0 {
+			return nil, errors.New("gotasks: Pipeline.QueueLease must be >= 0")
+		}
+		if p.QueueLease == 0 {
+			p.QueueLease = cfg.LeaseTime
+		}
+		if !p.NoFinalize {
+			if p.FinalizeBatch == 0 {
+				p.FinalizeBatch = min(2*p.ClaimBatch, 1000)
+			}
+			if p.FinalizeBatch < 2 || p.FinalizeBatch > 1000 {
+				return nil, errors.New("gotasks: Pipeline.FinalizeBatch must be between 2 and 1000")
+			}
+			if p.FinalizeInterval < 0 {
+				return nil, errors.New("gotasks: Pipeline.FinalizeInterval must be >= 0")
+			}
+			if p.FinalizeInterval == 0 {
+				p.FinalizeInterval = 300 * time.Millisecond
+			}
 		}
 	}
 	if cfg.Logger == nil {
@@ -331,11 +344,11 @@ func (m *Manager) Start() error {
 	m.runCtx, m.runCancel = context.WithCancel(context.Background())
 	m.claimCtx, m.claimCancel = context.WithCancel(m.runCtx)
 
-	if m.cfg.FinalizeBatchSize > 1 {
+	if m.finalizeOn() {
 		// Initialized BEFORE any worker goroutine exists: workers read
 		// finWake/finMargin on every finished task.
 		m.finWake = make(chan struct{}, 1)
-		m.finMargin = max(4*m.cfg.FinalizeInterval, 2*time.Second)
+		m.finMargin = max(4*m.cfg.Pipeline.FinalizeInterval, 2*time.Second)
 		m.workersDone = make(chan struct{})
 	}
 
@@ -349,10 +362,10 @@ func (m *Manager) Start() error {
 		}
 	}
 
-	if m.cfg.MaxBatch > 1 {
-		// Batch mode: one fetcher feeds a bounded channel; the bound is the
-		// backpressure (capacity covers busy workers plus one full batch).
-		m.taskCh = make(chan *Task, m.cfg.Workers+m.cfg.MaxBatch)
+	if m.cfg.Pipeline != nil {
+		// Pipeline mode: one fetcher feeds a bounded channel; the bound is
+		// the backpressure (capacity covers busy workers plus one batch).
+		m.taskCh = make(chan *Task, m.cfg.Workers+m.cfg.Pipeline.ClaimBatch)
 		m.fetchNudge = make(chan struct{}, 1)
 		m.wg.Add(1)
 		go m.fetcherLoop()
@@ -394,7 +407,7 @@ func (m *Manager) Start() error {
 			}(fmt.Sprintf("worker-%d", i))
 		}
 	}
-	if m.cfg.FinalizeBatchSize > 1 {
+	if m.finalizeOn() {
 		// Spawned AFTER all workerWg.Add calls, so Wait can't fire early.
 		m.wg.Add(2)
 		go func() { // lets the flusher outlive the workers and drain
@@ -409,9 +422,15 @@ func (m *Manager) Start() error {
 		go m.reaperLoop()
 	}
 	m.cfg.Logger.Info("gotasks: started",
-		"workers", m.cfg.Workers, "max_batch", m.cfg.MaxBatch,
+		"workers", m.cfg.Workers, "pipeline", m.cfg.Pipeline != nil,
 		"change_stream", m.watchCh != nil, "types", m.types)
 	return nil
+}
+
+// finalizeOn reports whether batched finalization is active (pipeline mode
+// without NoFinalize). Single mode always writes outcomes immediately.
+func (m *Manager) finalizeOn() bool {
+	return m.cfg.Pipeline != nil && !m.cfg.Pipeline.NoFinalize
 }
 
 // idleWait blocks until there is a reason to try claiming again: the poll

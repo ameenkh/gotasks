@@ -475,7 +475,7 @@ func TestScenarioAtMostOnce(t *testing.T) {
 func TestScenarioBatchMode(t *testing.T) {
 	t.Parallel()
 	sc := newScenario(t, "batchmode",
-		gotasks.WithMaxBatch(16),
+		gotasks.WithPipelineMode(gotasks.PipelineConfig{ClaimBatch: 16, NoFinalize: true}),
 		gotasks.WithWorkers(8),
 	)
 	ctx := context.Background()
@@ -594,9 +594,10 @@ func (s *syncDurations) median() time.Duration {
 func TestScenarioBatchFinalize(t *testing.T) {
 	t.Parallel()
 	sc := newScenario(t, "batchfinalize",
-		gotasks.WithMaxBatch(16),
+		gotasks.WithPipelineMode(gotasks.PipelineConfig{
+			ClaimBatch: 16, FinalizeBatch: 64, FinalizeInterval: 25 * time.Millisecond,
+		}),
 		gotasks.WithWorkers(8),
-		gotasks.WithFinalizeBatch(64, 25*time.Millisecond),
 	)
 	ctx := context.Background()
 

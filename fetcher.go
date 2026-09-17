@@ -11,11 +11,8 @@ import (
 // avoids RTT-wasteful tiny top-ups when the channel is nearly full.
 func (m *Manager) fetcherLoop() {
 	defer m.wg.Done()
-	lowWater := max(1, m.cfg.MaxBatch/2)
-	queueLease := m.cfg.QueueLeaseTime
-	if queueLease == 0 {
-		queueLease = m.cfg.LeaseTime
-	}
+	lowWater := max(1, m.cfg.Pipeline.ClaimBatch/2)
+	queueLease := m.cfg.Pipeline.QueueLease
 	for {
 		select {
 		case <-m.claimCtx.Done():
@@ -35,7 +32,7 @@ func (m *Manager) fetcherLoop() {
 			continue
 		}
 
-		k := min(m.cfg.MaxBatch, free)
+		k := min(m.cfg.Pipeline.ClaimBatch, free)
 		tasks, err := m.store.ClaimBatch(m.claimCtx, m.claimOptions("fetcher", queueLease), k)
 		switch {
 		case err == nil:

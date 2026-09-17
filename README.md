@@ -118,18 +118,32 @@ claiming with `gotasks.WithFIFO()` when task staleness must stay bounded
 under overload; note that with parallel workers, *completion* order is
 never guaranteed in any mode.
 
-## Batch mode (big pipelines)
+## Pipeline mode (big pipelines)
 
-By default (`MaxBatch` = 1) each worker claims tasks directly — simple, no
-extra round trips. For high-throughput pipelines, enable batch mode:
+By default (single mode) each worker claims, handles, and acknowledges its
+tasks independently — simple, immediate visibility of every state change.
+For high-throughput pipelines, switch on pipeline mode:
 
 ```go
 m, err := gotasks.New(store,
     gotasks.WithWorkers(16),
-    gotasks.WithMaxBatch(32),                    // fetcher claims 32 per ~3 round trips
-    gotasks.WithQueueLeaseTime(2*time.Minute),   // channel-wait budget (default: LeaseTime)
+    gotasks.WithPipelineMode(gotasks.PipelineConfig{}), // all defaults
+    // or tuned:
+    // gotasks.WithPipelineMode(gotasks.PipelineConfig{
+    //     ClaimBatch:       64,              // tasks per fetch (default 32)
+    //     QueueLease:       2 * time.Minute, // channel-wait budget (default LeaseTime)
+    //     FinalizeBatch:    128,             // outcomes per bulk ack (default 2x ClaimBatch)
+    //     FinalizeInterval: 300 * time.Millisecond,
+    //     NoFinalize:       false,           // true = immediate acks, batched claims only
+    // }),
 )
 ```
+
+Mega fan-outs are first-class on the enqueue side too: `EnqueueMany` writes
+in chunks (default 1000, `mongostore.WithEnqueueChunkSize`), returns ids
+aligned with the input, and reports partial failures per index via
+`*gotasks.PartialEnqueueError` — a 100k-task broadcast neither builds one
+giant wire message nor fails opaquely.
 
 One fetcher per process claims batches under a **queue lease** and feeds a
 bounded channel; workers revalidate ownership with a single point-write (the
@@ -138,6 +152,16 @@ the contended claim query across the batch and moves head-of-queue racing
 from per-worker to per-process. A task that waits in the channel longer than
 the queue lease is dropped locally, unrun, and reclaimed — exactly-once
 execution per attempt is preserved (see the scenario tests).
+
+Pipeline mode also enables **batched finalization** by default: finished
+tasks' Complete/Fail writes are buffered and flushed as one bulk write (on
+size, interval, lease-deadline, or shutdown drain — whichever comes first).
+Safety policy: at-most-once tasks and outcomes whose remaining lease is
+inside the safety margin bypass the buffer and write immediately, so a
+buffered outcome can never outlive its lease while the process is alive. A
+crash loses at most one flush interval of finished-but-unrecorded outcomes —
+reclaimed and re-run under the standard at-least-once contract. Opt out with
+`NoFinalize: true`.
 
 ## Change-stream wakeup
 
@@ -162,35 +186,19 @@ as relative, not absolute):
 | Benchmark | Result |
 |---|---|
 | EnqueueSingle | ~4ms/task |
-| EnqueueMany (batches of 100) | ~9,700 tasks/sec |
+| EnqueueMany (batches of 100) | ~12,800 tasks/sec |
+| EnqueueMany (batches of 10,000, chunked) | ~36,000 tasks/sec |
 | Throughput, single mode, 4 workers | ~370 tasks/sec |
-| Throughput, single mode, 16 workers | ~635 tasks/sec |
-| Throughput, batch claim 16, 8 workers | ~555 tasks/sec |
-| Throughput, batch claim 64, 16 workers | ~660 tasks/sec |
-| Throughput, single 16 workers **+ batch finalize 64** | ~865 tasks/sec |
-| Throughput, batch claim 16, 8 workers **+ batch finalize 64** | ~790 tasks/sec |
-| Throughput, batch claim 64, 16 workers **+ batch finalize 128** | **~1,155 tasks/sec** |
+| Throughput, single mode, 16 workers | ~600 tasks/sec |
+| Throughput, pipeline 16×8 workers, NoFinalize | ~560 tasks/sec |
+| Throughput, pipeline 16×8 workers (defaults) | ~900 tasks/sec |
+| Throughput, pipeline 64×16 workers (defaults) | **~1,355 tasks/sec** |
 
-Reading the numbers: batch claim removed claiming as the bottleneck, which
-made the per-task finalize write the next one; batch finalize removes that
-too (+76% on the full pipeline). What remains is per-op latency of the
-remaining point-writes — far better on production Linux/Atlas than on this
-laptop setup.
-
-## Batched finalization
-
-```go
-gotasks.WithFinalizeBatch(64, 25*time.Millisecond)
-```
-
-Finished tasks' Complete/Fail writes are buffered per process and flushed
-as one bulk write (on size, interval, lease-deadline, or shutdown drain —
-whichever comes first). Safety policy: at-most-once tasks and outcomes
-whose remaining lease is inside the safety margin bypass the buffer and
-write immediately, so a buffered outcome can never outlive its lease while
-the process is alive. A crash loses at most one flush interval of
-finished-but-unrecorded outcomes — those tasks are reclaimed and re-run
-under the standard at-least-once contract. Off by default.
+Reading the numbers: batched claiming removed claiming as the bottleneck,
+which made the per-task finalize write the next one; pipeline mode's
+batched finalization (compare the NoFinalize row) removes that too. What
+remains is per-op latency of the remaining point-writes — far better on
+production Linux/Atlas than on this laptop setup.
 
 ## Retention
 

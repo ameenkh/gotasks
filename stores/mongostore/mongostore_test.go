@@ -810,3 +810,114 @@ func mustOID(t *testing.T, id string) any {
 	}
 	return o
 }
+
+func TestEnqueueManyChunked(t *testing.T) {
+	uri := os.Getenv("GOTASKS_TEST_MONGO_URI")
+	if uri == "" {
+		uri = "mongodb://localhost:27017"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	coll := fmt.Sprintf("tasks_test_chunk_%d", time.Now().UnixNano())
+	s, err := New(ctx, uri,
+		WithDatabase("gotasks_test"),
+		WithCollection(coll),
+		WithEnqueueChunkSize(100), // force 25 chunks
+	)
+	if err != nil {
+		t.Skipf("no MongoDB at %s: %v", uri, err)
+	}
+	t.Cleanup(func() {
+		bg := context.Background()
+		_ = s.col.Drop(bg)
+		_ = s.Close(bg)
+	})
+
+	bg := context.Background()
+	now := time.Now().UTC()
+	const total = 2500
+	tasks := make([]*gotasks.Task, total)
+	for i := range tasks {
+		tasks[i] = &gotasks.Task{
+			Type: "bulk", Payload: []byte(fmt.Sprintf(`{"i":%d}`, i)),
+			Status: gotasks.StatusPending, MaxAttempts: 3,
+			RunAt: now, CreatedAt: now, UpdatedAt: now,
+		}
+	}
+	ids, err := s.Enqueue(bg, tasks)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if len(ids) != total {
+		t.Fatalf("got %d ids, want %d", len(ids), total)
+	}
+	for i, id := range ids {
+		if id == "" {
+			t.Fatalf("id %d is empty on a fully successful batch", i)
+		}
+	}
+	n, err := s.col.CountDocuments(bg, map[string]any{"status": "pending"})
+	if err != nil || n != total {
+		t.Fatalf("inserted %d docs, want %d (%v)", n, total, err)
+	}
+}
+
+func TestEnqueueManyPartialFailure(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Occupy a unique key so one batch entry collides.
+	if _, err := s.Enqueue(ctx, []*gotasks.Task{{
+		Type: "job", UniqueKey: "held", Payload: []byte(`{"first":true}`),
+		Status: gotasks.StatusPending, MaxAttempts: 3,
+		RunAt: now, CreatedAt: now, UpdatedAt: now,
+	}}); err != nil {
+		t.Fatalf("setup enqueue: %v", err)
+	}
+
+	batch := make([]*gotasks.Task, 5)
+	for i := range batch {
+		batch[i] = &gotasks.Task{
+			Type: "job", Payload: []byte(fmt.Sprintf(`{"i":%d}`, i)),
+			Status: gotasks.StatusPending, MaxAttempts: 3,
+			RunAt: now, CreatedAt: now, UpdatedAt: now,
+		}
+	}
+	batch[2].UniqueKey = "held" // collides
+
+	ids, err := s.Enqueue(ctx, batch)
+	var pe *gotasks.PartialEnqueueError
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v, want PartialEnqueueError", err)
+	}
+	if len(pe.Failures) != 1 || pe.Failures[0].Index != 2 {
+		t.Fatalf("failures = %+v, want exactly index 2", pe.Failures)
+	}
+	if !errors.Is(pe.Failures[0].Err, gotasks.ErrDuplicateTask) {
+		t.Errorf("failure cause should match ErrDuplicateTask: %v", pe.Failures[0].Err)
+	}
+	if len(ids) != 5 || ids[2] != "" {
+		t.Fatalf("ids = %v, want aligned with empty index 2", ids)
+	}
+	for i, id := range ids {
+		if i != 2 && id == "" {
+			t.Errorf("id %d empty although inserted", i)
+		}
+	}
+	// The other four really landed (5 docs total incl. the key holder).
+	n, _ := s.col.CountDocuments(ctx, map[string]any{"type": "job"})
+	if n != 5 {
+		t.Fatalf("collection has %d docs, want 5", n)
+	}
+	// Single-task dup keeps the DuplicateTaskError contract.
+	_, err = s.Enqueue(ctx, []*gotasks.Task{{
+		Type: "job", UniqueKey: "held", Payload: []byte(`{"again":true}`),
+		Status: gotasks.StatusPending, MaxAttempts: 3,
+		RunAt: now, CreatedAt: now, UpdatedAt: now,
+	}})
+	var dup *gotasks.DuplicateTaskError
+	if !errors.As(err, &dup) || dup.ExistingID == "" {
+		t.Fatalf("single-task dup: got %v, want DuplicateTaskError with existing id", err)
+	}
+}

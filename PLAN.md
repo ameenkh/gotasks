@@ -143,7 +143,16 @@ Module: `github.com/ameenkh/gotasks`
 - [ ] Named queues phase 2: per-queue pools inside one manager (one
       fetcher/channel/worker-set per configured queue), plus a
       (queue, status, run_at, _id) index when queue-filtered claiming
-      becomes the norm
+      becomes the norm. Include sharded-cluster guidance (discussed
+      2026-09-18): queue as shard-key prefix scales writes horizontally;
+      caveats — claims must filter by queue to stay shard-targeted
+      (WithQueues effectively mandatory when sharded), and unique indexes
+      must include the shard key, so unique_key becomes per-queue on
+      sharded deployments (document or redesign before claiming support).
+      Note: manual queue sharding for contention already composes today
+      (WithQueue("q-"+hash%N) + WithQueues) — and unsorted claiming +
+      batch claim already removed most claim contention, so no dedicated
+      virtual-partition feature is planned.
 - [ ] Priorities in the claim sort
 - [x] Change-stream wakeup — implemented 2026-09-16. Optional Watcher
       capability interface on the store (Store interface unchanged);
@@ -188,7 +197,29 @@ Module: `github.com/ameenkh/gotasks`
       numbers in the README. First finding: throughput plateaus ~600/s on
       dev hardware regardless of claim mode → the per-task finalize write
       is now the bottleneck, which is precisely the batch-finalize case.
-- [ ] Chunked mega-batch enqueue with partial-failure reporting
+- [x] Chunked mega-batch enqueue with partial-failure reporting —
+      implemented 2026-09-18. Ids generated client-side upfront, inserts
+      chunked (WithEnqueueChunkSize, default 1000); returned ids stay
+      aligned with the input ("" at failed indexes) and partial failures
+      surface as *PartialEnqueueError with per-index causes (dup-key
+      entries match ErrDuplicateTask); a hard error fails the current +
+      remaining chunks and stops. Single-task unique-key conflicts keep
+      the DuplicateTaskError contract. Measured ~36k tasks/sec enqueue-side
+      at 10k-task batches on dev hardware.
+
+## API consolidation (2026-09-18, post-v0.3.0 — ships as v0.4.0)
+
+- [x] Pipeline mode: WithMaxBatch / WithQueueLeaseTime / WithFinalizeBatch
+      replaced by one WithPipelineMode(PipelineConfig{ClaimBatch,
+      QueueLease, FinalizeBatch, FinalizeInterval, NoFinalize}). Two crisp
+      modes: SINGLE (default) = claim, handle, acknowledge independently,
+      no buffering ever, immediate visibility; PIPELINE = batched claims +
+      channel + batched finalization ON by default (NoFinalize to opt out).
+      Zero values are a complete setup (claim 32, finalize 64, 300ms).
+      Rationale: finalize batching only pays where throughput intent is
+      explicit, and pipeline users have already accepted pipeline
+      semantics; newcomers keep read-your-writes. Benchmarks: pipeline
+      64x16 defaults ~1,355 tasks/sec (vs ~600 single 16w) on dev laptop.
 
 ## v1.0 — Ecosystem
 
@@ -211,6 +242,14 @@ Module: `github.com/ameenkh/gotasks`
   unique keys can't serve as the dedup: they're released at done/dead, so a
   lagging node could re-enqueue a finished occurrence.) Open choices:
   robfig/cron parser vs interval-only syntax; skip vs backfill missed ticks.
+- **FIFO groups / per-key serial processing** (from the 2026-09-18 queue-
+  sharding discussion): hash an entity to a group and process each group
+  serially while groups run in parallel — Kafka-partition semantics, the
+  strongest differentiator in this tier (Oban's paid feature). Sharding
+  alone does NOT give this: serial-per-group requires concurrency=1 per
+  group, i.e. a group-level lease the claim respects ("claim from group G
+  only while holding G's lease") — the golocks lease primitive again.
+  Real design effort; revisit on user demand.
 - **Pause/resume queues**: parked 2026-09-15 (same shape as cancellation: a
   flag the claim path respects). If revisited: a per-queue/per-type flag
   document that the claim filter checks — paused types simply stop matching.

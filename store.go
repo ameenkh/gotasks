@@ -25,6 +25,25 @@ var (
 	ErrDuplicateTask = errors.New("gotasks: duplicate unique key")
 )
 
+// EnqueueFailure is one failed entry of a batch enqueue.
+type EnqueueFailure struct {
+	Index int // position in the input batch
+	Err   error
+}
+
+// PartialEnqueueError reports a partially successful batch enqueue: entries
+// not listed in Failures were inserted (chunked writes are not atomic).
+// The ids returned alongside this error stay aligned with the input, with
+// "" at each failed index.
+type PartialEnqueueError struct {
+	Failures []EnqueueFailure
+}
+
+func (e *PartialEnqueueError) Error() string {
+	return fmt.Sprintf("gotasks: %d entries of the batch failed to enqueue (first: index %d: %v)",
+		len(e.Failures), e.Failures[0].Index, e.Failures[0].Err)
+}
+
 // DuplicateTaskError reports a unique-key conflict on enqueue.
 // errors.Is(err, ErrDuplicateTask) matches it; ExistingID is the id of the
 // active task holding the key ("" if it finished between insert and lookup).
@@ -99,7 +118,11 @@ type Watcher interface {
 // *DuplicateTaskError. The key is released when the task reaches done/dead.
 type Store interface {
 	// Enqueue inserts tasks (batch; callers pass a single-element slice for
-	// one task) and returns their assigned ids in order.
+	// one task) and returns their assigned ids aligned with the input.
+	// Large batches may be written in chunks; on partial failure the ids
+	// slice carries "" at failed indexes and the error is a
+	// *PartialEnqueueError (single-task unique-key conflicts keep returning
+	// *DuplicateTaskError).
 	Enqueue(ctx context.Context, tasks []*Task) ([]string, error)
 
 	// Claim atomically takes one runnable task and returns it with

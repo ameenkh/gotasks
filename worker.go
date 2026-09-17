@@ -97,7 +97,7 @@ func (m *Manager) process(workerID string, t *Task) {
 // window. t.LockedUntil may be stale-early if the heartbeat extended the
 // lease meanwhile — that errs toward the immediate path, which is safe.
 func (m *Manager) shouldBufferOutcome(t *Task) bool {
-	if m.cfg.FinalizeBatchSize <= 1 || t.MaxAttempts == 1 {
+	if !m.finalizeOn() || t.MaxAttempts == 1 {
 		return false
 	}
 	return time.Until(t.LockedUntil) >= m.finMargin
@@ -153,14 +153,14 @@ func (m *Manager) flusherLoop() {
 		n := len(m.finBuf)
 		var deadline time.Time
 		if n > 0 {
-			deadline = m.finOldest.Add(m.cfg.FinalizeInterval)
+			deadline = m.finOldest.Add(m.cfg.Pipeline.FinalizeInterval)
 			if leaseEdge := m.finMinLease.Add(-m.finMargin / 2); leaseEdge.Before(deadline) {
 				deadline = leaseEdge
 			}
 		}
 		m.finMu.Unlock()
 
-		if n >= m.cfg.FinalizeBatchSize || (n > 0 && !time.Now().Before(deadline)) {
+		if n >= m.cfg.Pipeline.FinalizeBatch || (n > 0 && !time.Now().Before(deadline)) {
 			m.flushOutcomes()
 			continue
 		}
