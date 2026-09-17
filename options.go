@@ -55,9 +55,12 @@ type Config struct {
 	// sustained overload. Scheduling (run_at) is enforced by the claim
 	// filter in both modes — FIFO only orders already-due tasks.
 	FIFO bool
-	// Queues restricts this manager to claiming from the named queues.
-	// Empty (default) serves all queues. Tasks are assigned a queue at
-	// enqueue via WithQueue (DefaultQueue otherwise).
+	// Queues is the explicit set of queues this manager consumes — like
+	// every queue system, consumers subscribe to named queues; nothing is
+	// consumed implicitly. Default: [DefaultQueue]. A task enqueued to a
+	// named queue (WithQueue) is only processed by managers listing that
+	// queue. WithQueues REPLACES the set (include DefaultQueue explicitly
+	// if the manager should serve it too).
 	Queues []string
 	// Logger receives worker/reaper diagnostics. Default slog.Default().
 	Logger *slog.Logger
@@ -96,7 +99,8 @@ func WithFIFO() Option {
 	return func(c *Config) { c.FIFO = true }
 }
 
-// WithQueues restricts this manager to the named queues (see Config.Queues).
+// WithQueues sets the explicit queue subscription for this manager (see
+// Config.Queues). It replaces the default [DefaultQueue] set.
 func WithQueues(queues ...string) Option {
 	return func(c *Config) { c.Queues = queues }
 }

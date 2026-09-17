@@ -129,16 +129,27 @@ func build(ctx context.Context, client *mongo.Client, cfg config) (*Store, error
 }
 
 func (s *Store) ensureIndexes(ctx context.Context) error {
-	_, err := s.col.Indexes().CreateMany(ctx, []mongo.IndexModel{
-		// Claim, pending branch + (run_at, _id) sort.
-		{Keys: bson.D{{Key: "status", Value: 1}, {Key: "run_at", Value: 1}, {Key: "_id", Value: 1}}},
+	indexes := []mongo.IndexModel{
+		// THE claim index: managers always subscribe to explicit queues, so
+		// every claim carries a queue clause and hits the leading equality.
+		// (run_at, _id) after (queue, status) also serves the FIFO sort.
+		// Pre-v0.5 deployments can drop the old "status_1_run_at_1__id_1".
+		{
+			Keys: bson.D{{Key: "queue", Value: 1}, {Key: "status", Value: 1},
+				{Key: "run_at", Value: 1}, {Key: "_id", Value: 1}},
+			Options: options.Index().SetName("queue_claim"),
+		},
 		// Claim stale-reclaim branch + reaper sweep.
 		{Keys: bson.D{{Key: "status", Value: 1}, {Key: "locked_until", Value: 1}}},
-		// TTL retention: docs are deleted once expires_at passes; docs
-		// without the field (pending/running) are never touched.
+		// TTL retention: docs are deleted once expires_at passes. Sparse:
+		// only finished tasks carry the field, so the index stays tiny
+		// (cache-resident) and pending inserts don't pay a write into it.
+		// Named explicitly so it never conflicts with a pre-v0.4 non-sparse
+		// "expires_at_1" (drop that one manually after upgrading).
 		{
-			Keys:    bson.D{{Key: "expires_at", Value: 1}},
-			Options: options.Index().SetExpireAfterSeconds(0),
+			Keys: bson.D{{Key: "expires_at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(0).
+				SetSparse(true).SetName("expires_at_ttl"),
 		},
 		// Unique keys: unique only while the field exists — it is unset when
 		// a task reaches done/dead, releasing the key.
@@ -147,14 +158,11 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 			Options: options.Index().SetUnique(true).
 				SetPartialFilterExpression(bson.M{"unique_key": bson.M{"$exists": true}}),
 		},
-		// ClaimBatch's winners-fetch looks up by the batch lease token; the
-		// partial index keeps it cheap and only covers in-flight tasks.
-		{
-			Keys: bson.D{{Key: "lease_token", Value: 1}},
-			Options: options.Index().
-				SetPartialFilterExpression(bson.M{"lease_token": bson.M{"$exists": true}}),
-		},
-	})
+		// No lease_token index: ClaimBatch's winners-fetch targets the known
+		// candidate _ids instead, so token lookups never need one (pre-v0.4
+		// deployments can drop the leftover "lease_token_1" index).
+	}
+	_, err := s.col.Indexes().CreateMany(ctx, indexes)
 	return err
 }
 
@@ -457,7 +465,9 @@ func (s *Store) ClaimBatch(ctx context.Context, claim gotasks.ClaimOptions, k in
 		return nil, nil // all candidates stolen; more work may exist — retry
 	}
 
-	won, err := s.col.Find(ctx, bson.M{"lease_token": token})
+	// Winners are a subset of the candidates, so target their _ids (point
+	// lookups) and filter by token — no lease_token index needed.
+	won, err := s.col.Find(ctx, bson.M{"_id": bson.M{"$in": ids}, "lease_token": token})
 	if err != nil {
 		return nil, fmt.Errorf("mongostore: claim batch fetch: %w", err)
 	}

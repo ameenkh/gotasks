@@ -118,6 +118,14 @@ func New(store Store, opts ...Option) (*Manager, error) {
 	if cfg.FallbackPoll <= 0 {
 		return nil, errors.New("gotasks: FallbackPoll must be > 0")
 	}
+	if len(cfg.Queues) == 0 {
+		cfg.Queues = []string{DefaultQueue}
+	}
+	for _, q := range cfg.Queues {
+		if q == "" {
+			return nil, errors.New("gotasks: queue names must not be empty")
+		}
+	}
 	if p := cfg.Pipeline; p != nil {
 		// Resolve pipeline defaults in place; the rest of the manager reads
 		// the resolved values.

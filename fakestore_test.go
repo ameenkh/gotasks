@@ -65,6 +65,9 @@ func (s *fakeStore) Enqueue(_ context.Context, tasks []*Task) ([]string, error) 
 		}
 		s.seq++
 		c := cloneTask(t)
+		if c.Queue == "" {
+			c.Queue = DefaultQueue
+		}
 		c.ID = fmt.Sprintf("task-%d", s.seq)
 		s.tasks[c.ID] = c
 		ids[i] = c.ID

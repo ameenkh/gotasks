@@ -64,7 +64,9 @@ type ClaimOptions struct {
 	WorkerID string
 	// Types restricts claims to these task types; empty = all types.
 	Types []string
-	// Queues restricts claims to these queues; empty = all queues.
+	// Queues restricts claims to these queues. Empty = all queues, a
+	// store-level convenience for tests/tools: the manager always supplies
+	// at least [DefaultQueue], and the claim index requires the clause.
 	Queues []string
 	// FIFO requests oldest-first claim order ((run_at, id) ascending).
 	// False (the default) lets the store pick whichever runnable task is

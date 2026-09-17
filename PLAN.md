@@ -221,6 +221,42 @@ Module: `github.com/ameenkh/gotasks`
       semantics; newcomers keep read-your-writes. Benchmarks: pipeline
       64x16 defaults ~1,355 tasks/sec (vs ~600 single 16w) on dev laptop.
 
+## Index review (2026-09-18, explain-verified)
+
+- [x] Final index set (every library query is index-served; claim $or runs
+      as SUBPLAN, ClaimBatch step 1 is covered):
+      1. "queue_claim" (queue, status, run_at, _id) — THE claim index +
+         FIFO order; usable by every claim because queue subscription is
+         explicit (see below)
+      2. (status, locked_until) — stale reclaim, reaper, RequeueDead prefix
+      3. "expires_at_ttl" (expires_at) TTL, SPARSE — finished tasks only;
+         pending inserts don't write into it
+      4. (unique_key) unique, partial $exists — active keyed tasks only
+      Removed: (lease_token) partial — ClaimBatch's winners-fetch targets
+      the known candidate _ids + token filter (bench: 64x16 pipeline
+      1356 -> 1420 tasks/sec); and (status, run_at, _id) — superseded by
+      queue_claim once every claim carries a queue clause. Explain-measured
+      3101 -> 32 docsExamined per 32-task claim at a 99:1 queue skew.
+      Upgrade note for pre-v0.5 collections: drop "lease_token_1",
+      "expires_at_1" (non-sparse) and "status_1_run_at_1__id_1" manually.
+      "RAM index" clarification: no per-index RAM mode exists in community
+      MongoDB — the lever is keeping indexes small enough to stay in
+      WiredTiger cache, which is what the partial/sparse strategy does.
+
+## Explicit queue subscription (2026-09-18 — BREAKING, ships as v0.5.0)
+
+- [x] Managers consume exactly the queues they declare: Config.Queues
+      defaults to [DefaultQueue]; WithQueues replaces the set; empty queue
+      names rejected. No implicit drain-everything mode and deliberately NO
+      WithAllQueues escape (every producer/consumer system requires
+      explicit subscription — decided by Ameen). A named queue needs a
+      manager naming it. This is what makes queue_claim THE claim index
+      with no opt-ins. Store-level ClaimOptions.Queues empty still means
+      "all" as a test/tool convenience; the manager never sends empty.
+      mongostore.WithQueueClaimIndex() removed (lived <1 day, pre-release).
+      Changelog: "managers now consume only their configured queues
+      (default: default); tasks in other queues require WithQueues".
+
 ## v1.0 — Ecosystem
 
 - [ ] Hooks/middleware (OnClaim/OnComplete/OnFail/OnDead)
