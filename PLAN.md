@@ -145,7 +145,49 @@ Module: `github.com/ameenkh/gotasks`
       (queue, status, run_at, _id) index when queue-filtered claiming
       becomes the norm
 - [ ] Priorities in the claim sort
-- [ ] Change-stream wakeup (replica sets), polling fallback
+- [x] Change-stream wakeup — implemented 2026-09-16. Optional Watcher
+      capability interface on the store (Store interface unchanged);
+      mongostore tails a $match-filtered stream (inserts of matching
+      pending tasks; updates touching run_at or status=pending), coalesces
+      into level-triggered capacity-1 nudges, tracks the min future run_at
+      with a timer (covers retry backoffs + scheduled tasks), reconnects
+      with resume tokens and nudges after blind windows. Manager: auto-
+      detect at Start with silent poll fallback (WithoutChangeStream to
+      force), FallbackPoll safety net (default 30s) while the stream is
+      healthy, broadcast wakeup for single mode, direct fetcher wakeup for
+      batch mode. Measured: ~11ms median pickup with polling at 10s. CI and
+      local Mongo now run as single-node replica sets.
+- [x] Batch finalize — implemented 2026-09-17 (WithFinalizeBatch(size,
+      interval), off by default; Store gains FinalizeBatch + Outcome;
+      workers buffer, a flusher bulkWrites). Measured on the benchmark
+      suite: full pipeline (batch claim 64 + finalize 128, 16 workers)
+      658 -> 1157 tasks/sec (+76%); single-mode + finalize 64: +36%.
+      Design as agreed, lease-aware buffering:
+      - Safety net: a missed flush degrades into exactly the died-worker
+        path (stale reclaim / reaper) and the flush's fenced entries no-op
+        (ErrLeaseLost per op) — correctness is never at risk, only
+        duplicate execution.
+      - Buffer gate: outcomes with remaining lease < SafetyMargin
+        (max(4x flush interval, 2s)) finalize immediately instead of
+        buffering — no added cost, no added risk for the risky ones.
+      - Deadline trigger: flusher force-flushes when the earliest buffered
+        LockedUntil approaches the margin (min-tracking, same shape as the
+        change-stream timer), so a buffered outcome cannot outlive its
+        lease while the process is alive.
+      - max_attempts=1 outcomes NEVER buffer (prevents "succeeded but
+        recorded dead" via the reaper; preserves at-most-once semantics).
+      - Fenced-out flush entries are logged + counted for observability.
+      - Residual risk: crash/freeze with buffered outcomes — widens the
+        existing crash-after-handler window by <= one flush interval; same
+        at-least-once contract, no new failure class.
+      - Flush triggers: N outcomes (~64) / interval (~25-50ms) / lease
+        deadline / shutdown drain. Opt-in (immediate finalize stays the
+        default), off for at-most-once regardless.
+- [x] Benchmark suite (bench_test.go, 2026-09-16): enqueue single/batch +
+      end-to-end throughput across worker/MaxBatch configs; reference
+      numbers in the README. First finding: throughput plateaus ~600/s on
+      dev hardware regardless of claim mode → the per-task finalize write
+      is now the bottleneck, which is precisely the batch-finalize case.
 - [ ] Chunked mega-batch enqueue with partial-failure reporting
 
 ## v1.0 — Ecosystem
@@ -153,8 +195,10 @@ Module: `github.com/ameenkh/gotasks`
 - [ ] Hooks/middleware (OnClaim/OnComplete/OnFail/OnDead)
 - [ ] slog integration (done in v0.1), Prometheus metrics, OTel spans
 - [ ] Introspection API (counts by status/type, list/filter) + `gotasksctl`
-- [ ] Postgres store (`FOR UPDATE SKIP LOCKED`), in-memory store promoted to
-      a public package
+- [ ] Transactional enqueue via Mongo sessions (replica sets): Enqueue joins
+      the caller's transaction so business writes and their tasks commit
+      atomically — closes the gap with Postgres queues' headline feature
+- [ ] In-memory store promoted to a public package (users' unit tests)
 - [ ] Benchmarks, chaos test (kill workers mid-task; assert no loss/dup)
 - [ ] Docs site, CI, semver releases
 
@@ -179,6 +223,20 @@ Module: `github.com/ameenkh/gotasks`
 
 ## v2+ (deferred)
 
+- Postgres (or other) stores — decided against 2026-09-16: gotasks is
+  Mongo-native by identity. Postgres's FOR UPDATE SKIP LOCKED is genuinely
+  the better claim primitive and transactional enqueue is its killer
+  feature, but that market is owned by River/Oban and a port would be a
+  Mongo-shaped transplant. Instead we lean into Mongo-only mechanisms
+  (change streams, pipeline updates, sessions for transactional enqueue,
+  shard-aware queues). The Store interface stays as an internal seam and
+  test boundary, not a multi-store promise.
+- Message/stream semantics (discussed 2026-09-16): pub/sub fan-out and
+  consumer groups as a `gotasks/streams` sub-package on change streams +
+  per-group offset docs — NOT a pivot of the core. Identity stays "job
+  queue, not message broker": tasks have state, history, and exactly one
+  owner; broker-scale users are better served by actual brokers. Revisit
+  only on real user demand.
 - Workflows/chains (parent-child, fan-out/fan-in)
 - Web dashboard
 - Multi-tenant namespacing

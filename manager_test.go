@@ -674,3 +674,198 @@ func TestManagerServesOnlyItsQueues(t *testing.T) {
 		t.Errorf("handled %d tasks, want 1", done.Load())
 	}
 }
+
+// watchingFakeStore adds Watcher support to the fake store; nudges are sent
+// manually by the test.
+type watchingFakeStore struct {
+	*fakeStore
+	watch chan struct{}
+}
+
+func (s *watchingFakeStore) WatchRunnable(ctx context.Context, types, queues []string) (<-chan struct{}, error) {
+	return s.watch, nil
+}
+
+// With a change stream active, polls stretch to FallbackPoll — so pickup
+// within the test window proves the nudge path works, in both modes.
+func TestChangeStreamNudgeWakesWorkers(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		opts []Option
+	}{
+		{"single", nil},
+		{"batch", []Option{WithMaxBatch(4)}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			ws := &watchingFakeStore{fakeStore: newFakeStore(), watch: make(chan struct{}, 1)}
+			opts := append([]Option{
+				WithPollInterval(10 * time.Minute), // ensure polling can't explain pickup
+				WithFallbackPoll(10 * time.Minute),
+				WithReapInterval(0),
+			}, mode.opts...)
+			m := testManager(t, ws, opts...)
+
+			var done atomic.Int32
+			_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+				done.Add(1)
+				return nil, nil
+			})
+			startManager(t, m)
+			time.Sleep(100 * time.Millisecond) // let workers reach their idle wait
+
+			id, _ := Enqueue(context.Background(), m, "job", struct{}{})
+			time.Sleep(150 * time.Millisecond)
+			if task := ws.get(id); task.Status == StatusDone {
+				t.Fatal("task ran without a nudge — polling should be idle for 10m")
+			}
+			ws.watch <- struct{}{}
+			waitForStatus(t, ws.fakeStore, id, StatusDone)
+			if done.Load() != 1 {
+				t.Errorf("handled %d, want 1", done.Load())
+			}
+		})
+	}
+}
+
+func TestWithoutChangeStreamIgnoresWatcher(t *testing.T) {
+	ws := &watchingFakeStore{fakeStore: newFakeStore(), watch: make(chan struct{}, 1)}
+	m := testManager(t, ws, WithoutChangeStream()) // PollInterval 5ms from testManager
+
+	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		return nil, nil
+	})
+	id, _ := Enqueue(context.Background(), m, "job", struct{}{})
+	startManager(t, m)
+	waitForStatus(t, ws.fakeStore, id, StatusDone) // polling picked it up; no nudge ever sent
+}
+
+func TestFinalizeBatchFlushBySize(t *testing.T) {
+	fs := newFakeStore()
+	// Huge interval: only the size trigger (3) can explain a prompt flush.
+	m := testManager(t, fs,
+		WithLeaseTime(time.Minute),
+		WithFinalizeBatch(3, 10*time.Minute),
+		WithWorkers(2))
+
+	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		return map[string]bool{"ok": true}, nil
+	})
+	ids, _ := EnqueueMany(context.Background(), m, "job", make([]struct{}, 3))
+	startManager(t, m)
+
+	for _, id := range ids {
+		task := waitForStatus(t, fs, id, StatusDone)
+		if len(task.Result) == 0 {
+			t.Errorf("result lost through batch finalize: %+v", task)
+		}
+	}
+}
+
+func TestFinalizeBatchFlushByInterval(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs,
+		WithLeaseTime(time.Minute),
+		WithFinalizeBatch(1000, 120*time.Millisecond), // size can't trigger
+		WithWorkers(1))
+
+	ran := make(chan struct{})
+	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		close(ran)
+		return nil, nil
+	})
+	id, _ := Enqueue(context.Background(), m, "job", struct{}{})
+	startManager(t, m)
+
+	<-ran
+	// Right after the handler, the outcome is buffered: DB still says running.
+	time.Sleep(20 * time.Millisecond)
+	if task := fs.get(id); task.Status != StatusRunning {
+		t.Logf("note: flushed faster than expected (status %s)", task.Status)
+	}
+	waitForStatus(t, fs, id, StatusDone) // interval flush lands
+}
+
+func TestFinalizeBatchAtMostOnceBypasses(t *testing.T) {
+	fs := newFakeStore()
+	// Interval so long that only the bypass can finish the task quickly.
+	m := testManager(t, fs,
+		WithLeaseTime(time.Minute),
+		WithFinalizeBatch(1000, 10*time.Minute))
+
+	_ = RegisterHandler(m, "once", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		return nil, nil
+	})
+	id, _ := Enqueue(context.Background(), m, "once", struct{}{}, WithMaxAttempts(1))
+	startManager(t, m)
+	waitForStatus(t, fs, id, StatusDone) // immediate path, no buffering
+}
+
+func TestFinalizeBatchLeaseMarginBypasses(t *testing.T) {
+	fs := newFakeStore()
+	// LeaseTime 1s < margin (2s): every outcome bypasses the buffer.
+	m := testManager(t, fs,
+		WithLeaseTime(time.Second),
+		WithFinalizeBatch(1000, 10*time.Minute))
+
+	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		return nil, nil
+	})
+	id, _ := Enqueue(context.Background(), m, "job", struct{}{})
+	startManager(t, m)
+	waitForStatus(t, fs, id, StatusDone)
+}
+
+func TestFinalizeBatchDrainsOnStop(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs,
+		WithLeaseTime(time.Minute),
+		WithFinalizeBatch(1000, 10*time.Minute), // neither size nor interval will fire
+		WithWorkers(2))
+
+	var ran atomic.Int32
+	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		ran.Add(1)
+		return nil, nil
+	})
+	ids, _ := EnqueueMany(context.Background(), m, "job", make([]struct{}, 4))
+	if err := m.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for ran.Load() < 4 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	// Stop's drain must have flushed the buffered outcomes.
+	for _, id := range ids {
+		if task := fs.get(id); task.Status != StatusDone {
+			t.Errorf("outcome not drained on Stop: %+v", task)
+		}
+	}
+}
+
+func TestFinalizeBatchFailuresRetryAndDie(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs,
+		WithLeaseTime(time.Minute),
+		WithFinalizeBatch(2, 30*time.Millisecond))
+
+	var calls atomic.Int32
+	_ = RegisterHandler(m, "flaky", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		calls.Add(1)
+		return nil, errors.New("boom")
+	})
+	id, _ := Enqueue(context.Background(), m, "flaky", struct{}{}, WithMaxAttempts(2))
+	startManager(t, m)
+
+	task := waitForStatus(t, fs, id, StatusDead)
+	if task.Attempts != 2 || len(task.Errors) != 2 {
+		t.Errorf("attempts=%d errors=%d, want 2/2", task.Attempts, len(task.Errors))
+	}
+	if calls.Load() != 2 {
+		t.Errorf("handler calls = %d, want 2", calls.Load())
+	}
+}

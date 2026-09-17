@@ -57,6 +57,33 @@ type ClaimOptions struct {
 	Lease time.Duration
 }
 
+// Outcome is one finished attempt, carried between a worker and (batched)
+// finalization. Failure nil = success.
+type Outcome struct {
+	Task     *Task
+	Result   json.RawMessage // success only; nil = no result
+	Failure  *TaskError      // non-nil = this attempt failed
+	RetryAt  time.Time       // failure, non-terminal: the next run_at
+	Terminal bool            // failure: attempts exhausted -> dead
+}
+
+// Watcher is an optional Store capability: pushing "work may be available"
+// wakeup signals so managers don't rely on polling while idle. The manager
+// type-asserts for it at Start; stores without it (or whose deployment
+// can't support it) are simply polled.
+//
+// Contract: the returned channel is a coalesced, level-triggered nudge —
+// capacity 1, dropped when full; a receive means "claim now, something may
+// be runnable". False positives are fine (one empty claim); implementations
+// should be conservative the other way. The implementation is responsible
+// for reconnection (nudging after any blind window) and for signaling when
+// known future run_at times come due. The channel closes when ctx ends.
+// An error return means watching is unavailable (e.g. no replica set) and
+// the caller should fall back to polling.
+type Watcher interface {
+	WatchRunnable(ctx context.Context, types, queues []string) (<-chan struct{}, error)
+}
+
 // Store is the persistence backend. Implementations must make Claim atomic:
 // under concurrent claims, each runnable task is handed to exactly one caller.
 //
@@ -103,6 +130,12 @@ type Store interface {
 	// ExtendLease pushes t's locked_until to now+lease and returns the new
 	// deadline. Used by the manager's heartbeat for long-running handlers.
 	ExtendLease(ctx context.Context, t *Task, lease time.Duration) (time.Time, error)
+
+	// FinalizeBatch applies many Complete/Fail outcomes in one round trip.
+	// Each entry is fenced individually, exactly like Complete/Fail; an
+	// entry whose lease was lost is skipped, not an error. Returns how many
+	// entries were skipped that way (for observability).
+	FinalizeBatch(ctx context.Context, outcomes []Outcome) (lost int64, err error)
 
 	// Requeue resets one dead task to pending: attempts back to 0, runnable
 	// now, retention expiry cleared. The errors array is kept as history.

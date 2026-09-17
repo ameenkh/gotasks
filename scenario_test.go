@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -38,6 +39,7 @@ func scenarioDuration() time.Duration {
 type scenario struct {
 	t   *testing.T
 	m   *gotasks.Manager
+	st  *mongostore.Store
 	col *mongo.Collection
 }
 
@@ -89,7 +91,7 @@ func newScenario(t *testing.T, name string, opts ...gotasks.Option) *scenario {
 		_ = col.Drop(ctx)
 		_ = client.Disconnect(ctx)
 	})
-	return &scenario{t: t, m: m, col: col}
+	return &scenario{t: t, m: m, st: st, col: col}
 }
 
 func (s *scenario) start() {
@@ -483,6 +485,125 @@ func TestScenarioBatchMode(t *testing.T) {
 		func(ctx context.Context, task *gotasks.Task, p struct{ N int64 }) (any, error) {
 			calls.hit(task.ID)
 			time.Sleep(5 * time.Millisecond) // small but real work
+			return nil, nil
+		})
+	if err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+	sc.start()
+
+	enqueued := sc.produce(5*time.Millisecond, func(i int64) {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "work", struct{ N int64 }{N: i}); err != nil {
+			t.Errorf("enqueue %d: %v", i, err)
+		}
+	})
+	sc.drain(30 * time.Second)
+
+	counts := sc.statusCounts()
+	if counts[gotasks.StatusDone] != enqueued || counts[gotasks.StatusDead] != 0 {
+		t.Errorf("counts = %+v, want done=%d dead=0", counts, enqueued)
+	}
+	tasks, total := calls.total()
+	if tasks != enqueued || total != enqueued {
+		t.Errorf("executed %d tasks / %d calls, want exactly-once for all %d", tasks, total, enqueued)
+	}
+	if n := sc.count(bson.M{"status": "done", "attempts": bson.M{"$ne": 1}}); n != 0 {
+		t.Errorf("%d done tasks have attempts != 1", n)
+	}
+}
+
+// Scenario: change-stream wakeup latency. Polling is stretched to 10s so
+// only the stream can explain fast pickup. Contract: median enqueue->start
+// latency well under the poll interval; everything completes.
+func TestScenarioChangeStreamLatency(t *testing.T) {
+	t.Parallel()
+	sc := newScenario(t, "cslatency",
+		gotasks.WithPollInterval(10*time.Second),
+		gotasks.WithFallbackPoll(10*time.Second),
+	)
+	ctx := context.Background()
+
+	// Probe: skip when the deployment can't do change streams.
+	probeCtx, probeCancel := context.WithCancel(context.Background())
+	if _, err := probeStore(sc).WatchRunnable(probeCtx, nil, nil); err != nil {
+		probeCancel()
+		t.Skipf("change streams unavailable: %v", err)
+	}
+	probeCancel()
+
+	type timed struct {
+		SentAt time.Time `json:"sent_at"`
+	}
+	var latencies syncDurations
+	err := gotasks.RegisterHandler(sc.m, "ping",
+		func(ctx context.Context, task *gotasks.Task, p timed) (any, error) {
+			latencies.add(time.Since(p.SentAt))
+			return nil, nil
+		})
+	if err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+	sc.start()
+	time.Sleep(300 * time.Millisecond) // let workers reach their idle wait
+
+	enqueued := sc.produce(500*time.Millisecond, func(i int64) {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "ping", timed{SentAt: time.Now()}); err != nil {
+			t.Errorf("enqueue %d: %v", i, err)
+		}
+	})
+	sc.drain(30 * time.Second)
+
+	counts := sc.statusCounts()
+	if counts[gotasks.StatusDone] != enqueued {
+		t.Errorf("counts = %+v, want done=%d", counts, enqueued)
+	}
+	med := latencies.median()
+	t.Logf("change-stream pickup latency: median %s over %d tasks", med, enqueued)
+	// Generous bound: far below the 10s poll, so pickup came from the stream.
+	if med > time.Second {
+		t.Errorf("median latency %s — stream wakeup not working (poll is 10s)", med)
+	}
+}
+
+func probeStore(sc *scenario) *mongostore.Store { return sc.st }
+
+type syncDurations struct {
+	mu sync.Mutex
+	ds []time.Duration
+}
+
+func (s *syncDurations) add(d time.Duration) {
+	s.mu.Lock()
+	s.ds = append(s.ds, d)
+	s.mu.Unlock()
+}
+
+func (s *syncDurations) median() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.ds) == 0 {
+		return 0
+	}
+	sorted := append([]time.Duration(nil), s.ds...)
+	slices.Sort(sorted)
+	return sorted[len(sorted)/2]
+}
+
+// Scenario: the full throughput pipeline — batch claim + batch finalize —
+// under a continuous stream. Contract: exactly-once, everything done.
+func TestScenarioBatchFinalize(t *testing.T) {
+	t.Parallel()
+	sc := newScenario(t, "batchfinalize",
+		gotasks.WithMaxBatch(16),
+		gotasks.WithWorkers(8),
+		gotasks.WithFinalizeBatch(64, 25*time.Millisecond),
+	)
+	ctx := context.Background()
+
+	var calls callCounter
+	err := gotasks.RegisterHandler(sc.m, "work",
+		func(ctx context.Context, task *gotasks.Task, p struct{ N int64 }) (any, error) {
+			calls.hit(task.ID)
 			return nil, nil
 		})
 	if err != nil {

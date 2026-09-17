@@ -58,20 +58,12 @@ func (m *Manager) fetcherLoop() {
 			// Full or short batch: loop immediately (railway) — a short
 			// batch's next iteration hits ErrNoTask and idles below.
 		case errors.Is(err, ErrNoTask):
-			select {
-			case <-m.claimCtx.Done():
-				return
-			case <-time.After(m.cfg.PollInterval):
-			}
+			m.idleWait()
 		case m.claimCtx.Err() != nil:
 			return
 		default:
 			m.cfg.Logger.Error("gotasks: batch claim failed", "error", err)
-			select {
-			case <-m.claimCtx.Done():
-				return
-			case <-time.After(m.cfg.PollInterval):
-			}
+			m.idleWait()
 		}
 	}
 }

@@ -18,6 +18,9 @@ go get github.com/ameenkh/gotasks
   lease was reclaimed can no longer complete/fail the task.
 - **Railway workers** — workers keep claiming while tasks keep coming, and
   only sleep the poll interval when the queue is empty.
+- **Change-stream wakeup** — on replica sets, idle managers are woken by
+  Mongo's change stream in milliseconds instead of polling (automatic;
+  falls back to polling on standalone servers).
 - **Typed API** — payloads and handlers are generic; no `map[string]interface{}`.
 - **Inspectable** — tasks are plain BSON documents; open them in mongosh or
   Compass, payloads included.
@@ -135,6 +138,59 @@ the contended claim query across the batch and moves head-of-queue racing
 from per-worker to per-process. A task that waits in the channel longer than
 the queue lease is dropped locally, unrun, and reclaimed — exactly-once
 execution per attempt is preserved (see the scenario tests).
+
+## Change-stream wakeup
+
+On a replica set (any Atlas cluster; a single-node `--replSet` works too),
+the manager automatically tails the tasks collection's change stream and
+wakes the moment work appears — median enqueue→pickup latency is ~10ms in
+the scenario tests, versus half the poll interval otherwise. Ownership is
+untouched: the stream only *wakes* claimers; atomic claims still decide who
+runs what. Future `run_at`s (scheduled tasks, retry backoffs) are tracked by
+a min-timer fed from the same events, and a long safety-net poll
+(`WithFallbackPoll`, default 30s) covers stream gaps. On standalone servers
+this silently falls back to plain polling; `WithoutChangeStream()` forces
+polling explicitly.
+
+## Benchmarks
+
+`go test -bench . -benchtime 2000x -run xxx .` (needs local MongoDB).
+Reference numbers from a dev laptop with MongoDB 7 in Docker Desktop
+(macOS's container I/O inflates per-op latency several-fold — treat these
+as relative, not absolute):
+
+| Benchmark | Result |
+|---|---|
+| EnqueueSingle | ~4ms/task |
+| EnqueueMany (batches of 100) | ~9,700 tasks/sec |
+| Throughput, single mode, 4 workers | ~370 tasks/sec |
+| Throughput, single mode, 16 workers | ~635 tasks/sec |
+| Throughput, batch claim 16, 8 workers | ~555 tasks/sec |
+| Throughput, batch claim 64, 16 workers | ~660 tasks/sec |
+| Throughput, single 16 workers **+ batch finalize 64** | ~865 tasks/sec |
+| Throughput, batch claim 16, 8 workers **+ batch finalize 64** | ~790 tasks/sec |
+| Throughput, batch claim 64, 16 workers **+ batch finalize 128** | **~1,155 tasks/sec** |
+
+Reading the numbers: batch claim removed claiming as the bottleneck, which
+made the per-task finalize write the next one; batch finalize removes that
+too (+76% on the full pipeline). What remains is per-op latency of the
+remaining point-writes — far better on production Linux/Atlas than on this
+laptop setup.
+
+## Batched finalization
+
+```go
+gotasks.WithFinalizeBatch(64, 25*time.Millisecond)
+```
+
+Finished tasks' Complete/Fail writes are buffered per process and flushed
+as one bulk write (on size, interval, lease-deadline, or shutdown drain —
+whichever comes first). Safety policy: at-most-once tasks and outcomes
+whose remaining lease is inside the safety margin bypass the buffer and
+write immediately, so a buffered outcome can never outlive its lease while
+the process is alive. A crash loses at most one flush interval of
+finished-but-unrecorded outcomes — those tasks are reclaimed and re-run
+under the standard at-least-once contract. Off by default.
 
 ## Retention
 

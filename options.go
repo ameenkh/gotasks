@@ -50,6 +50,28 @@ type Config struct {
 	// reclaimable by other processes. 0 (default) uses LeaseTime. Only
 	// meaningful in batch mode.
 	QueueLeaseTime time.Duration
+	// FinalizeBatchSize enables batched finalization when > 1: finished
+	// tasks' Complete/Fail writes are buffered per process and flushed as
+	// one bulk write. 0/1 (default) finalizes immediately. Outcomes are
+	// NEVER buffered when risky: at-most-once tasks (max_attempts=1) and
+	// tasks whose remaining lease is under the safety margin
+	// (max(4x FinalizeInterval, 2s)) take the immediate path, so a buffered
+	// outcome cannot outlive its lease while the process is alive. The
+	// trade-off: a crash loses up to FinalizeInterval of finished-but-
+	// unflushed outcomes — those tasks are reclaimed and re-run (the normal
+	// at-least-once contract, slightly widened).
+	FinalizeBatchSize int
+	// FinalizeInterval is the longest an outcome may wait in the finalize
+	// buffer (default 50ms when batching is enabled).
+	FinalizeInterval time.Duration
+	// DisableChangeStream forces polling even when the store supports
+	// change-stream wakeup. Default false: the manager tries the stream at
+	// Start and falls back to polling silently if unavailable.
+	DisableChangeStream bool
+	// FallbackPoll is the safety-net poll cadence used while a change
+	// stream is active (it catches anything a stream gap missed). Default
+	// 30s. Ignored when no stream is active — PollInterval applies then.
+	FallbackPoll time.Duration
 	// FIFO makes claims take the oldest runnable task first ((run_at, id)
 	// ascending). Off by default: unsorted claiming is faster and spreads
 	// contention, but doesn't bound how stale a task can get under
@@ -78,6 +100,28 @@ func WithLogger(l *slog.Logger) Option          { return func(c *Config) { c.Log
 
 // HeartbeatAuto selects the automatic heartbeat cadence: LeaseTime/3.
 const HeartbeatAuto time.Duration = -1
+
+// WithFinalizeBatch enables batched finalization: up to size outcomes are
+// buffered and flushed as one bulk write, at most interval after the first
+// entered the buffer (see Config.FinalizeBatchSize for the safety policy).
+func WithFinalizeBatch(size int, interval time.Duration) Option {
+	return func(c *Config) {
+		c.FinalizeBatchSize = size
+		c.FinalizeInterval = interval
+	}
+}
+
+// WithoutChangeStream forces polling even when the store supports
+// change-stream wakeup (see Config.DisableChangeStream).
+func WithoutChangeStream() Option {
+	return func(c *Config) { c.DisableChangeStream = true }
+}
+
+// WithFallbackPoll sets the safety-net poll cadence used while a change
+// stream is active (see Config.FallbackPoll).
+func WithFallbackPoll(d time.Duration) Option {
+	return func(c *Config) { c.FallbackPoll = d }
+}
 
 // WithFIFO makes claims take the oldest runnable task first (see
 // Config.FIFO). Off by default.

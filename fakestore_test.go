@@ -3,6 +3,7 @@ package gotasks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -173,6 +174,24 @@ func (s *fakeStore) Fail(_ context.Context, task *Task, taskErr TaskError, retry
 	t.LockedBy, t.LeaseToken = "", ""
 	t.UpdatedAt = time.Now().UTC()
 	return nil
+}
+
+func (s *fakeStore) FinalizeBatch(ctx context.Context, outcomes []Outcome) (int64, error) {
+	var lost int64
+	for _, o := range outcomes {
+		var err error
+		if o.Failure != nil {
+			err = s.Fail(ctx, o.Task, *o.Failure, o.RetryAt, o.Terminal)
+		} else {
+			err = s.Complete(ctx, o.Task, o.Result)
+		}
+		if errors.Is(err, ErrLeaseLost) {
+			lost++
+		} else if err != nil {
+			return lost, err
+		}
+	}
+	return lost, nil
 }
 
 func (s *fakeStore) ExtendLease(_ context.Context, task *Task, lease time.Duration) (time.Time, error) {

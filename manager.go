@@ -38,6 +38,47 @@ type Manager struct {
 	// drain it and nudge the fetcher after each take.
 	taskCh     chan *Task
 	fetchNudge chan struct{}
+
+	// Change-stream wakeup (when the store implements Watcher and the
+	// deployment supports it): watchCh delivers coalesced nudges. In batch
+	// mode the fetcher consumes it directly; in single mode a pump fans it
+	// out to all workers via wake.
+	watchCh <-chan struct{}
+	wake    *broadcaster
+
+	// Batched finalization (FinalizeBatchSize > 1): workers buffer
+	// outcomes; the flusher writes them as one bulkWrite. workerWg tracks
+	// worker goroutines only, so the flusher can outlive them and drain.
+	finMu       sync.Mutex
+	finBuf      []Outcome
+	finOldest   time.Time // when the oldest buffered outcome entered
+	finMinLease time.Time // earliest LockedUntil among buffered outcomes
+	finWake     chan struct{}
+	finMargin   time.Duration
+	workerWg    sync.WaitGroup
+	workersDone chan struct{}
+}
+
+// broadcaster fans one nudge out to every waiter (single mode has N idle
+// workers, and a channel receive would wake only one).
+type broadcaster struct {
+	mu sync.Mutex
+	ch chan struct{}
+}
+
+func newBroadcaster() *broadcaster { return &broadcaster{ch: make(chan struct{})} }
+
+func (b *broadcaster) wait() <-chan struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.ch
+}
+
+func (b *broadcaster) signal() {
+	b.mu.Lock()
+	close(b.ch)
+	b.ch = make(chan struct{})
+	b.mu.Unlock()
 }
 
 // New creates a Manager on top of a Store.
@@ -54,6 +95,7 @@ func New(store Store, opts ...Option) (*Manager, error) {
 		Backoff:            ExponentialBackoff(30*time.Second, time.Hour),
 		ReapInterval:       60 * time.Second,
 		MaxBatch:           1,
+		FallbackPoll:       30 * time.Second,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -78,6 +120,20 @@ func New(store Store, opts ...Option) (*Manager, error) {
 	}
 	if cfg.QueueLeaseTime < 0 {
 		return nil, errors.New("gotasks: QueueLeaseTime must be >= 0")
+	}
+	if cfg.FallbackPoll <= 0 {
+		return nil, errors.New("gotasks: FallbackPoll must be > 0")
+	}
+	if cfg.FinalizeBatchSize < 0 || cfg.FinalizeBatchSize > 1000 {
+		return nil, errors.New("gotasks: FinalizeBatchSize must be between 0 and 1000")
+	}
+	if cfg.FinalizeBatchSize > 1 {
+		if cfg.FinalizeInterval < 0 {
+			return nil, errors.New("gotasks: FinalizeInterval must be >= 0")
+		}
+		if cfg.FinalizeInterval == 0 {
+			cfg.FinalizeInterval = 50 * time.Millisecond
+		}
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -275,6 +331,24 @@ func (m *Manager) Start() error {
 	m.runCtx, m.runCancel = context.WithCancel(context.Background())
 	m.claimCtx, m.claimCancel = context.WithCancel(m.runCtx)
 
+	if m.cfg.FinalizeBatchSize > 1 {
+		// Initialized BEFORE any worker goroutine exists: workers read
+		// finWake/finMargin on every finished task.
+		m.finWake = make(chan struct{}, 1)
+		m.finMargin = max(4*m.cfg.FinalizeInterval, 2*time.Second)
+		m.workersDone = make(chan struct{})
+	}
+
+	if !m.cfg.DisableChangeStream {
+		if w, ok := m.store.(Watcher); ok {
+			if ch, err := w.WatchRunnable(m.claimCtx, m.types, m.cfg.Queues); err == nil {
+				m.watchCh = ch
+			} else {
+				m.cfg.Logger.Info("gotasks: change-stream wakeup unavailable; polling", "reason", err)
+			}
+		}
+	}
+
 	if m.cfg.MaxBatch > 1 {
 		// Batch mode: one fetcher feeds a bounded channel; the bound is the
 		// backpressure (capacity covers busy workers plus one full batch).
@@ -284,22 +358,81 @@ func (m *Manager) Start() error {
 		go m.fetcherLoop()
 		for i := 0; i < m.cfg.Workers; i++ {
 			m.wg.Add(1)
-			go m.batchWorkerLoop(fmt.Sprintf("worker-%d", i))
+			m.workerWg.Add(1)
+			go func(id string) {
+				defer m.workerWg.Done()
+				m.batchWorkerLoop(id)
+			}(fmt.Sprintf("worker-%d", i))
 		}
 	} else {
 		// Single mode: workers claim directly, no fetcher, no handshake.
+		if m.watchCh != nil {
+			// Fan stream nudges out to all idle workers.
+			m.wake = newBroadcaster()
+			m.wg.Add(1)
+			go func() {
+				defer m.wg.Done()
+				for {
+					select {
+					case <-m.claimCtx.Done():
+						return
+					case _, ok := <-m.watchCh:
+						if !ok {
+							return
+						}
+						m.wake.signal()
+					}
+				}
+			}()
+		}
 		for i := 0; i < m.cfg.Workers; i++ {
 			m.wg.Add(1)
-			go m.workerLoop(fmt.Sprintf("worker-%d", i))
+			m.workerWg.Add(1)
+			go func(id string) {
+				defer m.workerWg.Done()
+				m.workerLoop(id)
+			}(fmt.Sprintf("worker-%d", i))
 		}
+	}
+	if m.cfg.FinalizeBatchSize > 1 {
+		// Spawned AFTER all workerWg.Add calls, so Wait can't fire early.
+		m.wg.Add(2)
+		go func() { // lets the flusher outlive the workers and drain
+			defer m.wg.Done()
+			m.workerWg.Wait()
+			close(m.workersDone)
+		}()
+		go m.flusherLoop()
 	}
 	if m.cfg.ReapInterval > 0 {
 		m.wg.Add(1)
 		go m.reaperLoop()
 	}
 	m.cfg.Logger.Info("gotasks: started",
-		"workers", m.cfg.Workers, "max_batch", m.cfg.MaxBatch, "types", m.types)
+		"workers", m.cfg.Workers, "max_batch", m.cfg.MaxBatch,
+		"change_stream", m.watchCh != nil, "types", m.types)
 	return nil
+}
+
+// idleWait blocks until there is a reason to try claiming again: the poll
+// cadence elapses (PollInterval, or the longer FallbackPoll safety net when
+// a change stream is active), a stream nudge arrives, or shutdown starts.
+func (m *Manager) idleWait() {
+	poll := m.cfg.PollInterval
+	var wakeup <-chan struct{}
+	if m.watchCh != nil {
+		poll = m.cfg.FallbackPoll
+		if m.wake != nil {
+			wakeup = m.wake.wait() // single mode: broadcast
+		} else {
+			wakeup = m.watchCh // batch mode: fetcher is the sole consumer
+		}
+	}
+	select {
+	case <-m.claimCtx.Done():
+	case <-time.After(poll):
+	case <-wakeup:
+	}
 }
 
 // Stop drains the pool: workers stop claiming immediately and in-flight

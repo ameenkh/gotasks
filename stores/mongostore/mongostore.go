@@ -434,18 +434,18 @@ func leaseFilter(id primitive.ObjectID, leaseToken string) bson.M {
 	}
 }
 
-func (s *Store) Complete(ctx context.Context, t *gotasks.Task, result json.RawMessage) error {
+// completeWrite builds the fenced filter+update marking t done.
+func (s *Store) completeWrite(t *gotasks.Task, result json.RawMessage, now time.Time) (bson.M, bson.M, error) {
 	o, err := oid(t.ID)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	now := time.Now().UTC()
 	set := bson.M{
 		"status":     string(gotasks.StatusDone),
 		"updated_at": now,
 	}
 	if raw, err := jsonToRaw(result); err != nil {
-		return err
+		return nil, nil, err
 	} else if raw != nil {
 		set["result"] = raw
 	}
@@ -456,7 +456,15 @@ func (s *Store) Complete(ctx context.Context, t *gotasks.Task, result json.RawMe
 		"$set":   set,
 		"$unset": bson.M{"locked_by": "", "lease_token": "", "unique_key": ""},
 	}
-	res, err := s.col.UpdateOne(ctx, leaseFilter(o, t.LeaseToken), update)
+	return leaseFilter(o, t.LeaseToken), update, nil
+}
+
+func (s *Store) Complete(ctx context.Context, t *gotasks.Task, result json.RawMessage) error {
+	filter, update, err := s.completeWrite(t, result, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	res, err := s.col.UpdateOne(ctx, filter, update)
 	if err != nil {
 		return fmt.Errorf("mongostore: complete: %w", err)
 	}
@@ -466,12 +474,12 @@ func (s *Store) Complete(ctx context.Context, t *gotasks.Task, result json.RawMe
 	return nil
 }
 
-func (s *Store) Fail(ctx context.Context, t *gotasks.Task, taskErr gotasks.TaskError, retryAt time.Time, terminal bool) error {
+// failWrite builds the fenced filter+update recording a failed attempt.
+func (s *Store) failWrite(t *gotasks.Task, taskErr gotasks.TaskError, retryAt time.Time, terminal bool, now time.Time) (bson.M, bson.M, error) {
 	o, err := oid(t.ID)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	now := time.Now().UTC()
 	set := bson.M{"updated_at": now}
 	unset := bson.M{"locked_by": "", "lease_token": ""}
 	if terminal {
@@ -490,7 +498,15 @@ func (s *Store) Fail(ctx context.Context, t *gotasks.Task, taskErr gotasks.TaskE
 		"$push":  bson.M{"errors": taskErr},
 		"$unset": unset,
 	}
-	res, err := s.col.UpdateOne(ctx, leaseFilter(o, t.LeaseToken), update)
+	return leaseFilter(o, t.LeaseToken), update, nil
+}
+
+func (s *Store) Fail(ctx context.Context, t *gotasks.Task, taskErr gotasks.TaskError, retryAt time.Time, terminal bool) error {
+	filter, update, err := s.failWrite(t, taskErr, retryAt, terminal, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	res, err := s.col.UpdateOne(ctx, filter, update)
 	if err != nil {
 		return fmt.Errorf("mongostore: fail: %w", err)
 	}
@@ -498,6 +514,35 @@ func (s *Store) Fail(ctx context.Context, t *gotasks.Task, taskErr gotasks.TaskE
 		return gotasks.ErrLeaseLost
 	}
 	return nil
+}
+
+// FinalizeBatch applies many outcomes as one unordered bulkWrite; each
+// entry keeps the exact fencing of Complete/Fail. Lost = entries whose
+// lease was gone by flush time (reclaimed) — skipped, reported, not errors.
+func (s *Store) FinalizeBatch(ctx context.Context, outcomes []gotasks.Outcome) (int64, error) {
+	if len(outcomes) == 0 {
+		return 0, nil
+	}
+	now := time.Now().UTC()
+	models := make([]mongo.WriteModel, 0, len(outcomes))
+	for _, o := range outcomes {
+		var filter, update bson.M
+		var err error
+		if o.Failure != nil {
+			filter, update, err = s.failWrite(o.Task, *o.Failure, o.RetryAt, o.Terminal, now)
+		} else {
+			filter, update, err = s.completeWrite(o.Task, o.Result, now)
+		}
+		if err != nil {
+			return 0, err
+		}
+		models = append(models, mongo.NewUpdateOneModel().SetFilter(filter).SetUpdate(update))
+	}
+	res, err := s.col.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	if err != nil {
+		return 0, fmt.Errorf("mongostore: finalize batch: %w", err)
+	}
+	return int64(len(outcomes)) - res.MatchedCount, nil
 }
 
 func (s *Store) ExtendLease(ctx context.Context, t *gotasks.Task, lease time.Duration) (time.Time, error) {
@@ -618,6 +663,12 @@ func (s *Store) ReapExpired(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("mongostore: reap: %w", err)
 	}
 	return res.ModifiedCount, nil
+}
+
+// DropCollection drops the underlying tasks collection — a helper for
+// tests and benchmarks; production cleanup should use retention TTLs.
+func (s *Store) DropCollection(ctx context.Context) error {
+	return s.col.Drop(ctx)
 }
 
 func (s *Store) Close(ctx context.Context) error {

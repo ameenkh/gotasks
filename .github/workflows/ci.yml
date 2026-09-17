@@ -8,21 +8,26 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      mongo:
-        image: mongo:7
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping: 1})'"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     env:
       GOTASKS_TEST_MONGO_URI: mongodb://localhost:27017
       GOTASKS_SCENARIO_DURATION: 30s
     steps:
       - uses: actions/checkout@v4
+
+      # Single-node replica set: change streams need one, and the member
+      # host must be localhost so the Go driver can follow the topology.
+      - name: Start MongoDB (single-node replica set)
+        run: |
+          docker run -d --name mongo -p 27017:27017 mongo:7 --replSet rs0
+          for i in $(seq 1 30); do
+            docker exec mongo mongosh --quiet --eval 'db.runCommand({ping: 1})' >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec mongo mongosh --quiet --eval 'rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27017"}]})'
+          for i in $(seq 1 30); do
+            docker exec mongo mongosh --quiet --eval 'rs.isMaster().ismaster' 2>/dev/null | grep -q true && break
+            sleep 1
+          done
 
       - uses: actions/setup-go@v5
         with:

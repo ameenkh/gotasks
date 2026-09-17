@@ -42,11 +42,7 @@ func (m *Manager) workerLoop(id string) {
 		default:
 			m.cfg.Logger.Error("gotasks: claim failed", "worker", id, "error", err)
 		}
-		select {
-		case <-m.claimCtx.Done():
-			return
-		case <-time.After(m.cfg.PollInterval):
-		}
+		m.idleWait()
 	}
 }
 
@@ -76,34 +72,133 @@ func (m *Manager) process(workerID string, t *Task) {
 	result, err := m.invoke(entry, hctx, t)
 	stopHeartbeat()
 
-	fctx, cancel := m.finalizeContext()
-	defer cancel()
-
+	var o Outcome
 	if err != nil {
-		terminal := t.Attempts >= t.MaxAttempts
 		now := time.Now().UTC()
+		terminal := t.Attempts >= t.MaxAttempts
 		taskErr := TaskError{At: now, Attempt: t.Attempts, Worker: workerID, Message: err.Error()}
-		retryAt := now.Add(m.cfg.Backoff.Next(t.Attempts))
-		if ferr := m.store.Fail(fctx, t, taskErr, retryAt, terminal); ferr != nil {
-			if errors.Is(ferr, ErrLeaseLost) {
-				m.cfg.Logger.Warn("gotasks: task was reclaimed before failure could be recorded",
-					"id", t.ID, "type", t.Type)
-			} else {
-				m.cfg.Logger.Error("gotasks: recording failure failed", "id", t.ID, "type", t.Type, "error", ferr)
-			}
-		}
+		o = Outcome{Task: t, Failure: &taskErr, RetryAt: now.Add(m.cfg.Backoff.Next(t.Attempts)), Terminal: terminal}
 		m.cfg.Logger.Warn("gotasks: task attempt failed",
 			"id", t.ID, "type", t.Type, "attempt", t.Attempts, "max_attempts", t.MaxAttempts,
 			"terminal", terminal, "error", err)
+	} else {
+		o = Outcome{Task: t, Result: result}
+	}
+	if m.shouldBufferOutcome(t) {
+		m.bufferOutcome(o)
 		return
 	}
-	if cerr := m.store.Complete(fctx, t, result); cerr != nil {
-		if errors.Is(cerr, ErrLeaseLost) {
-			m.cfg.Logger.Warn("gotasks: task was reclaimed before completion could be recorded",
+	m.finalizeNow(o)
+}
+
+// shouldBufferOutcome applies the batch-finalize safety gate: buffer only
+// when batching is on, the task is not at-most-once (its semantics must
+// never wait in a buffer), and the lease comfortably outlives the buffer
+// window. t.LockedUntil may be stale-early if the heartbeat extended the
+// lease meanwhile — that errs toward the immediate path, which is safe.
+func (m *Manager) shouldBufferOutcome(t *Task) bool {
+	if m.cfg.FinalizeBatchSize <= 1 || t.MaxAttempts == 1 {
+		return false
+	}
+	return time.Until(t.LockedUntil) >= m.finMargin
+}
+
+// finalizeNow writes one outcome immediately (the only path when batching
+// is off; the bypass path otherwise).
+func (m *Manager) finalizeNow(o Outcome) {
+	fctx, cancel := m.finalizeContext()
+	defer cancel()
+	t := o.Task
+	var err error
+	if o.Failure != nil {
+		err = m.store.Fail(fctx, t, *o.Failure, o.RetryAt, o.Terminal)
+	} else {
+		err = m.store.Complete(fctx, t, o.Result)
+	}
+	if err != nil {
+		if errors.Is(err, ErrLeaseLost) {
+			m.cfg.Logger.Warn("gotasks: task was reclaimed before its outcome could be recorded",
 				"id", t.ID, "type", t.Type)
 		} else {
-			m.cfg.Logger.Error("gotasks: completing task failed", "id", t.ID, "type", t.Type, "error", cerr)
+			m.cfg.Logger.Error("gotasks: finalize failed", "id", t.ID, "type", t.Type, "error", err)
 		}
+	}
+}
+
+// bufferOutcome adds an outcome to the finalize buffer and wakes the
+// flusher (which flushes on size, interval, lease deadline, or drain).
+func (m *Manager) bufferOutcome(o Outcome) {
+	m.finMu.Lock()
+	if len(m.finBuf) == 0 {
+		m.finOldest = time.Now()
+		m.finMinLease = o.Task.LockedUntil
+	} else if o.Task.LockedUntil.Before(m.finMinLease) {
+		m.finMinLease = o.Task.LockedUntil
+	}
+	m.finBuf = append(m.finBuf, o)
+	m.finMu.Unlock()
+	select {
+	case m.finWake <- struct{}{}:
+	default:
+	}
+}
+
+// flusherLoop drains the finalize buffer as bulk writes. Flush triggers:
+// size reached, oldest entry aged past FinalizeInterval, earliest buffered
+// lease approaching the safety margin, or all workers done (drain).
+func (m *Manager) flusherLoop() {
+	defer m.wg.Done()
+	for {
+		m.finMu.Lock()
+		n := len(m.finBuf)
+		var deadline time.Time
+		if n > 0 {
+			deadline = m.finOldest.Add(m.cfg.FinalizeInterval)
+			if leaseEdge := m.finMinLease.Add(-m.finMargin / 2); leaseEdge.Before(deadline) {
+				deadline = leaseEdge
+			}
+		}
+		m.finMu.Unlock()
+
+		if n >= m.cfg.FinalizeBatchSize || (n > 0 && !time.Now().Before(deadline)) {
+			m.flushOutcomes()
+			continue
+		}
+		var timerC <-chan time.Time
+		if n > 0 {
+			timerC = time.After(time.Until(deadline))
+		}
+		select {
+		case <-m.workersDone:
+			m.flushOutcomes() // drain: workers can add nothing more
+			return
+		case <-m.finWake:
+		case <-timerC:
+		}
+	}
+}
+
+func (m *Manager) flushOutcomes() {
+	m.finMu.Lock()
+	buf := m.finBuf
+	m.finBuf = nil
+	m.finMu.Unlock()
+	if len(buf) == 0 {
+		return
+	}
+	fctx, cancel := m.finalizeContext()
+	defer cancel()
+	lost, err := m.store.FinalizeBatch(fctx, buf)
+	if err != nil {
+		// Outcomes are lost; the tasks recover via lease expiry (reclaim /
+		// reaper) exactly as if this process had died holding them.
+		m.cfg.Logger.Error("gotasks: finalize flush failed; tasks will be reclaimed",
+			"count", len(buf), "error", err)
+		return
+	}
+	if lost > 0 {
+		m.cfg.Logger.Warn("gotasks: finalize entries lost their lease before the flush",
+			"lost", lost, "flushed", len(buf))
 	}
 }
 

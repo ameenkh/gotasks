@@ -658,3 +658,155 @@ func TestQueueFieldAndFiltering(t *testing.T) {
 		}
 	}
 }
+
+// watchStore opens WatchRunnable and skips the test when change streams are
+// unavailable (standalone MongoDB).
+func watchStore(t *testing.T, s *Store, types, queues []string) (<-chan struct{}, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := s.WatchRunnable(ctx, types, queues)
+	if err != nil {
+		cancel()
+		t.Skipf("change streams unavailable (standalone Mongo?): %v", err)
+	}
+	t.Cleanup(cancel)
+	// Drain the initial backlog nudge.
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+	}
+	return ch, cancel
+}
+
+func expectNudge(t *testing.T, ch <-chan struct{}, within time.Duration, msg string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(within):
+		t.Fatalf("no nudge within %s: %s", within, msg)
+	}
+}
+
+func expectQuiet(t *testing.T, ch <-chan struct{}, during time.Duration, msg string) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatalf("unexpected nudge: %s", msg)
+	case <-time.After(during):
+	}
+}
+
+func TestWatchNudgesOnInsert(t *testing.T) {
+	s := testStore(t)
+	ch, _ := watchStore(t, s, []string{"job"}, nil)
+
+	enqueueOne(t, s, "job", `{"x":1}`, 3, time.Now().UTC())
+	expectNudge(t, ch, 3*time.Second, "insert of a due pending task")
+
+	// A type this watcher doesn't serve must not nudge (server-side $match).
+	enqueueOne(t, s, "other-type", `{"x":1}`, 3, time.Now().UTC())
+	expectQuiet(t, ch, 700*time.Millisecond, "insert of a foreign type")
+}
+
+func TestWatchNudgesOnRetryUpdate(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	enqueueOne(t, s, "job", `{"x":1}`, 3, now)
+	ch, _ := watchStore(t, s, []string{"job"}, nil)
+	// Drain the insert... it happened before the watch; claim the task.
+	task := claimOne(t, s, "w1")
+
+	// Non-terminal fail with an immediate retryAt -> update event with a
+	// past run_at -> immediate nudge.
+	te := gotasks.TaskError{At: now, Attempt: task.Attempts, Worker: "w1", Message: "boom"}
+	if err := s.Fail(ctx, task, te, now, false); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+	expectNudge(t, ch, 3*time.Second, "retry rescheduled to now")
+}
+
+func TestWatchMinTimerFiresForFutureRunAt(t *testing.T) {
+	s := testStore(t)
+	ch, _ := watchStore(t, s, []string{"job"}, nil)
+
+	delay := 1500 * time.Millisecond
+	start := time.Now()
+	enqueueOne(t, s, "job", `{"x":1}`, 3, time.Now().UTC().Add(delay))
+
+	// No premature nudge...
+	expectQuiet(t, ch, delay/2, "future run_at should not nudge early")
+	// ...but the min-timer fires close to the due time.
+	expectNudge(t, ch, delay, "min-timer for future run_at")
+	if elapsed := time.Since(start); elapsed < delay-100*time.Millisecond {
+		t.Fatalf("nudged too early: %s before the %s delay", elapsed, delay)
+	}
+}
+
+func TestFinalizeBatchMixedOutcomes(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	okID := enqueueOne(t, s, "job", `{"n":1}`, 3, now)
+	retryID := enqueueOne(t, s, "job", `{"n":2}`, 3, now)
+	deadID := enqueueOne(t, s, "job", `{"n":3}`, 3, now)
+	staleID := enqueueOne(t, s, "job", `{"n":4}`, 3, now)
+
+	byID := map[string]*gotasks.Task{}
+	for i := 0; i < 4; i++ {
+		task := claimOne(t, s, "w1")
+		byID[task.ID] = task
+	}
+	// Simulate the stale case: rotate staleID's token via reclaim before
+	// the flush lands.
+	staleTask := byID[staleID]
+	if _, err := s.col.UpdateOne(ctx,
+		map[string]any{"_id": mustOID(t, staleID)},
+		map[string]any{"$set": map[string]any{"lease_token": "rotated-elsewhere"}}); err != nil {
+		t.Fatalf("rotate token: %v", err)
+	}
+
+	te := gotasks.TaskError{At: now, Attempt: 1, Worker: "w1", Message: "boom"}
+	lost, err := s.FinalizeBatch(ctx, []gotasks.Outcome{
+		{Task: byID[okID], Result: []byte(`{"ok":true}`)},
+		{Task: byID[retryID], Failure: &te, RetryAt: now, Terminal: false},
+		{Task: byID[deadID], Failure: &te, Terminal: true},
+		{Task: staleTask, Result: []byte(`{"ok":true}`)}, // fenced out
+	})
+	if err != nil {
+		t.Fatalf("FinalizeBatch: %v", err)
+	}
+	if lost != 1 {
+		t.Errorf("lost = %d, want 1 (the rotated-token entry)", lost)
+	}
+
+	check := func(id string, want gotasks.Status) *taskDoc {
+		var doc taskDoc
+		if err := s.col.FindOne(ctx, map[string]any{"_id": mustOID(t, id)}).Decode(&doc); err != nil {
+			t.Fatalf("find %s: %v", id, err)
+		}
+		if doc.Status != string(want) {
+			t.Errorf("task %s status = %s, want %s", id, doc.Status, want)
+		}
+		return &doc
+	}
+	if doc := check(okID, gotasks.StatusDone); len(doc.Result) == 0 {
+		t.Error("result not stored through batch finalize")
+	}
+	check(retryID, gotasks.StatusPending)
+	if doc := check(deadID, gotasks.StatusDead); len(doc.Errors) != 1 {
+		t.Errorf("dead task errors = %d, want 1", len(doc.Errors))
+	}
+	check(staleID, gotasks.StatusRunning) // untouched: fencing held
+}
+
+func mustOID(t *testing.T, id string) any {
+	t.Helper()
+	o, err := oid(id)
+	if err != nil {
+		t.Fatalf("oid: %v", err)
+	}
+	return o
+}
