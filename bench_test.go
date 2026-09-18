@@ -32,7 +32,7 @@ func benchStore(b *testing.B) *mongostore.Store {
 	coll := fmt.Sprintf("bench_%d", time.Now().UnixNano())
 	st, err := mongostore.New(ctx, uri,
 		mongostore.WithDatabase("gotasks_bench"),
-		mongostore.WithCollection(coll),
+		mongostore.WithNamespace(coll),
 	)
 	if err != nil {
 		b.Skipf("no MongoDB at %s: %v", uri, err)
@@ -83,7 +83,7 @@ func benchThroughput(b *testing.B, opts ...gotasks.Option) {
 	m, err := gotasks.New(st, append([]gotasks.Option{
 		gotasks.WithQueues(gotasks.QueuePolicy{Name: "bench"}),
 		gotasks.WithPollInterval(50 * time.Millisecond),
-		gotasks.WithReapInterval(0),
+		gotasks.WithJanitor(gotasks.JanitorConfig{NoReap: true}),
 		gotasks.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	}, opts...)...)
 	if err != nil {

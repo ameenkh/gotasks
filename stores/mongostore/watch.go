@@ -71,7 +71,7 @@ func (s *Store) openStream(ctx context.Context, types, queues []string, resumeAf
 	if len(resumeAfter) > 0 {
 		opts = opts.SetResumeAfter(resumeAfter)
 	}
-	return s.col.Watch(ctx, pipeline, opts)
+	return s.tasksCol.Watch(ctx, pipeline, opts)
 }
 
 type streamEvent struct {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,6 +34,7 @@ func (m *Manager) workerLoop(id string) {
 		t, err := m.store.Claim(m.claimCtx, m.claimOptions(id, m.cfg.LeaseTime))
 		switch {
 		case err == nil && t != nil:
+			m.count(t.Queue, func(c *queueCounters) *atomic.Int64 { return &c.claimed }, 1)
 			m.process(id, t)
 			continue // railway: go straight for the next task
 		case errors.Is(err, ErrNoTask):
@@ -76,12 +78,18 @@ func (m *Manager) process(workerID string, t *Task) {
 	if err != nil {
 		now := time.Now().UTC()
 		terminal := t.Attempts >= t.MaxAttempts
+		if terminal {
+			m.count(t.Queue, func(c *queueCounters) *atomic.Int64 { return &c.dead }, 1)
+		} else {
+			m.count(t.Queue, func(c *queueCounters) *atomic.Int64 { return &c.failed }, 1)
+		}
 		taskErr := TaskError{At: now, Attempt: t.Attempts, Worker: workerID, Message: err.Error()}
 		o = Outcome{Task: t, Failure: &taskErr, RetryAt: now.Add(m.cfg.Backoff.Next(t.Attempts)), Terminal: terminal}
 		m.cfg.Logger.Warn("gotasks: task attempt failed",
 			"id", t.ID, "type", t.Type, "attempt", t.Attempts, "max_attempts", t.MaxAttempts,
 			"terminal", terminal, "error", err)
 	} else {
+		m.count(t.Queue, func(c *queueCounters) *atomic.Int64 { return &c.done }, 1)
 		o = Outcome{Task: t, Result: result}
 	}
 	if m.shouldBufferOutcome(t) {
@@ -257,23 +265,98 @@ func (m *Manager) invoke(entry handlerEntry, ctx context.Context, t *Task) (resu
 	return entry.fn(ctx, t)
 }
 
-func (m *Manager) reaperLoop() {
+// janitorLoop runs the manager's maintenance duties on their own clocks:
+// reaping (ReapInterval) and, when enabled, metrics (Metrics.Interval,
+// aligned to wall-clock window boundaries so all managers agree on window
+// identity for the cluster-wide gauge dedup).
+func (m *Manager) janitorLoop() {
 	defer m.wg.Done()
-	ticker := time.NewTicker(m.cfg.ReapInterval)
-	defer ticker.Stop()
+
+	jc := m.cfg.Janitor
+	now := time.Now()
+	var nextReap, nextMetrics time.Time
+	if !jc.NoReap {
+		nextReap = now.Add(jc.ReapInterval)
+	}
+	metricsOn := jc.Metrics != nil
+	if metricsOn {
+		if err := m.store.EnsureMetrics(m.claimCtx, jc.Metrics.Retention); err != nil {
+			m.cfg.Logger.Error("gotasks: metrics storage setup failed; metrics disabled", "error", err)
+			metricsOn = false
+		} else {
+			nextMetrics = now.Truncate(jc.Metrics.Interval).Add(jc.Metrics.Interval)
+		}
+	}
+	if nextReap.IsZero() && !metricsOn {
+		return
+	}
+
 	for {
+		next := nextReap
+		if metricsOn && (next.IsZero() || nextMetrics.Before(next)) {
+			next = nextMetrics
+		}
 		select {
 		case <-m.claimCtx.Done():
-			return
-		case <-ticker.C:
-			n, err := m.store.ReapExpired(m.claimCtx)
-			if err != nil {
-				if m.claimCtx.Err() == nil {
-					m.cfg.Logger.Error("gotasks: reap failed", "error", err)
-				}
-			} else if n > 0 {
-				m.cfg.Logger.Warn("gotasks: reaped stale tasks with exhausted attempts", "count", n)
+			if metricsOn {
+				m.flushMetrics(nextMetrics.Add(-jc.Metrics.Interval), true)
 			}
+			return
+		case <-time.After(time.Until(next)):
 		}
+		if !nextReap.IsZero() && !time.Now().Before(nextReap) {
+			m.reap()
+			nextReap = time.Now().Add(jc.ReapInterval)
+		}
+		if metricsOn && !time.Now().Before(nextMetrics) {
+			m.flushMetrics(nextMetrics.Add(-jc.Metrics.Interval), false)
+			nextMetrics = nextMetrics.Add(jc.Metrics.Interval)
+		}
+	}
+}
+
+func (m *Manager) reap() {
+	n, err := m.store.ReapExpired(m.claimCtx)
+	if err != nil {
+		if m.claimCtx.Err() == nil {
+			m.cfg.Logger.Error("gotasks: reap failed", "error", err)
+		}
+	} else if n > 0 {
+		m.cfg.Logger.Warn("gotasks: reaped stale tasks with exhausted attempts", "count", n)
+	}
+}
+
+// flushMetrics closes the window that STARTED at windowStart: snapshots
+// cluster-wide gauges (store dedups; first manager wins) and writes this
+// manager's exact counters, swap-reset atomically. Runs on a detached
+// context so the shutdown drain flush still lands.
+func (m *Manager) flushMetrics(windowStart time.Time, drain bool) {
+	interval := m.cfg.Janitor.Metrics.Interval
+	ctx, cancel := m.finalizeContext()
+	defer cancel()
+
+	if !drain { // gauges are point-in-time; skip during teardown
+		if err := m.store.SnapshotMetrics(ctx, m.queueNames, windowStart.UTC(), interval); err != nil {
+			m.cfg.Logger.Error("gotasks: metrics snapshot failed", "error", err)
+		}
+	}
+	counters := make(map[string]QueueCounters, len(m.counters))
+	for q, c := range m.counters {
+		qc := QueueCounters{
+			Enqueued: c.enqueued.Swap(0),
+			Claimed:  c.claimed.Swap(0),
+			Done:     c.done.Swap(0),
+			Failed:   c.failed.Swap(0),
+			Dead:     c.dead.Swap(0),
+		}
+		if qc != (QueueCounters{}) {
+			counters[q] = qc
+		}
+	}
+	if len(counters) == 0 {
+		return
+	}
+	if err := m.store.RecordCounters(ctx, m.managerID, windowStart.UTC(), interval, counters); err != nil {
+		m.cfg.Logger.Error("gotasks: metrics counters write failed", "error", err)
 	}
 }

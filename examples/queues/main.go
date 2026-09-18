@@ -34,7 +34,7 @@ func main() {
 	newStore := func() *mongostore.Store {
 		s, err := mongostore.FromClient(ctx, client,
 			mongostore.WithDatabase("gotasks_examples"),
-			mongostore.WithCollection("queues"),
+			mongostore.WithNamespace("queues"),
 		)
 		if err != nil {
 			log.Fatal(err)

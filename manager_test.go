@@ -17,7 +17,7 @@ func testManager(t *testing.T, store Store, opts ...Option) *Manager {
 		WithPollInterval(5 * time.Millisecond),
 		WithLeaseTime(time.Second),
 		WithBackoff(FixedBackoff(0)),
-		WithReapInterval(20 * time.Millisecond),
+		WithJanitor(JanitorConfig{ReapInterval: 20 * time.Millisecond}),
 	}
 	m, err := New(store, append(base, opts...)...)
 	if err != nil {
@@ -720,7 +720,7 @@ func TestChangeStreamNudgeWakesWorkers(t *testing.T) {
 			opts := append([]Option{
 				WithPollInterval(10 * time.Minute), // ensure polling can't explain pickup
 				WithFallbackPoll(10 * time.Minute),
-				WithReapInterval(0),
+				WithJanitor(JanitorConfig{NoReap: true}),
 			}, mode.opts...)
 			m := testManager(t, ws, opts...)
 
@@ -955,5 +955,104 @@ func TestEnqueueAddressingValidation(t *testing.T) {
 	}
 	if _, err := Enqueue(ctx, m, "default", "t", struct{}{}, TaskPolicy{}, TaskPolicy{}); err == nil {
 		t.Error("two TaskPolicy values accepted")
+	}
+}
+
+func TestRegistryRejectsPolicyDrift(t *testing.T) {
+	fs := newFakeStore()
+	ctx := context.Background()
+
+	// First manager registers the queue (lazily, at first enqueue).
+	m1 := testManager(t, fs, WithQueues(QueuePolicy{Name: "emails", TTL: time.Hour}))
+	if _, err := Enqueue(ctx, m1, "emails", "t", struct{}{}); err != nil {
+		t.Fatalf("first manager enqueue: %v", err)
+	}
+
+	// Identical redeclaration: fine.
+	m2 := testManager(t, fs, WithQueues(QueuePolicy{Name: "emails", TTL: time.Hour}))
+	if _, err := Enqueue(ctx, m2, "emails", "t", struct{}{}); err != nil {
+		t.Fatalf("identical redeclaration rejected: %v", err)
+	}
+
+	// Different TTL: enqueue AND Start must fail with ErrQueueConflict.
+	m3 := testManager(t, fs, WithQueues(QueuePolicy{Name: "emails", TTL: 2 * time.Hour}))
+	if _, err := Enqueue(ctx, m3, "emails", "t", struct{}{}); !errors.Is(err, ErrQueueConflict) {
+		t.Fatalf("drifted enqueue: got %v, want ErrQueueConflict", err)
+	}
+	_ = RegisterHandler(m3, "t", func(ctx context.Context, task *Task, _ struct{}) (any, error) { return nil, nil })
+	if err := m3.Start(); !errors.Is(err, ErrQueueConflict) {
+		t.Fatalf("drifted Start: got %v, want ErrQueueConflict", err)
+	}
+	// A failed Start must be retryable after the registry is fixed.
+	if err := fs.SetQueuePolicy(ctx, QueuePolicy{Name: "emails", TTL: 2 * time.Hour}); err != nil {
+		t.Fatalf("SetQueuePolicy: %v", err)
+	}
+	if err := m3.Start(); err != nil {
+		t.Fatalf("Start after deliberate policy change: %v", err)
+	}
+	t.Cleanup(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = m3.Stop(sctx)
+	})
+}
+
+func TestMetricsCountersExact(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs,
+		WithJanitor(JanitorConfig{ReapInterval: 20 * time.Millisecond, Metrics: &MetricsConfig{Interval: time.Second}}),
+		WithManagerName("test-mgr"))
+
+	var calls atomic.Int32
+	_ = RegisterHandler(m, "work", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		if calls.Add(1)%5 == 0 {
+			return nil, errors.New("boom") // every 5th attempt fails
+		}
+		return nil, nil
+	})
+
+	ctx := context.Background()
+	ids, err := EnqueueMany(ctx, m, "default", "work", make([]struct{}, 20), TaskPolicy{MaxAttempts: 3})
+	if err != nil {
+		t.Fatalf("EnqueueMany: %v", err)
+	}
+	startManager(t, m)
+	for _, id := range ids {
+		waitForStatus(t, fs, id, StatusDone)
+	}
+	// Stop drains the janitor, which flushes the final counter window.
+	sctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := m.Stop(sctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	got := fs.counterTotals("default")
+	if got.Enqueued != 20 || got.Done != 20 {
+		t.Errorf("enqueued=%d done=%d, want 20/20", got.Enqueued, got.Done)
+	}
+	if got.Failed != int64(calls.Load())-20 {
+		t.Errorf("failed=%d, want %d (attempts beyond the 20 successes)", got.Failed, calls.Load()-20)
+	}
+	if got.Claimed != int64(calls.Load()) {
+		t.Errorf("claimed=%d, want %d (one claim per handler call)", got.Claimed, calls.Load())
+	}
+	if got.Dead != 0 {
+		t.Errorf("dead=%d, want 0", got.Dead)
+	}
+}
+
+func TestMetricsOffByDefault(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs)
+	_ = RegisterHandler(m, "work", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		return nil, nil
+	})
+	id, _ := Enqueue(context.Background(), m, "default", "work", struct{}{})
+	startManager(t, m)
+	waitForStatus(t, fs, id, StatusDone)
+	time.Sleep(50 * time.Millisecond)
+	if n := len(fs.metrics); n != 0 {
+		t.Errorf("metrics written with metrics disabled: %d docs", n)
 	}
 }

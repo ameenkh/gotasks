@@ -27,7 +27,7 @@ func main() {
 
 	store, err := mongostore.New(ctx, "mongodb://localhost:27017",
 		mongostore.WithDatabase("gotasks_examples"),
-		mongostore.WithCollection("retries"),
+		mongostore.WithNamespace("retries"),
 	)
 	if err != nil {
 		log.Fatal(err)

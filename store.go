@@ -23,6 +23,11 @@ var (
 	// returned when enqueueing with a unique key that already has an active
 	// (pending/running) task.
 	ErrDuplicateTask = errors.New("gotasks: duplicate unique key")
+	// ErrQueueConflict is returned when a manager declares a queue whose
+	// policy differs from what the queues registry already records — policy
+	// drift across deployments is a startup error, never silent behavior.
+	// Deliberate changes go through Store.SetQueuePolicy.
+	ErrQueueConflict = errors.New("gotasks: queue policy conflicts with the registry")
 )
 
 // EnqueueFailure is one failed entry of a batch enqueue.
@@ -86,6 +91,17 @@ type Outcome struct {
 	Failure  *TaskError      // non-nil = this attempt failed
 	RetryAt  time.Time       // failure, non-terminal: the next run_at
 	Terminal bool            // failure: attempts exhausted -> dead
+}
+
+// QueueCounters is one manager instance's exact per-queue event counts for
+// one metrics window. Done/Failed/Dead are counted when the worker decides
+// the outcome (batched finalization may land the write moments later).
+type QueueCounters struct {
+	Enqueued int64
+	Claimed  int64
+	Done     int64
+	Failed   int64 // failed attempts that will retry
+	Dead     int64 // terminal failures
 }
 
 // Watcher is an optional Store capability: pushing "work may be available"
@@ -170,6 +186,37 @@ type Store interface {
 	// RequeueDead requeues every dead task (of taskType, or all types when
 	// taskType is ""), with the same resets as Requeue. Returns the count.
 	RequeueDead(ctx context.Context, taskType string) (int64, error)
+
+	// RegisterQueues records the declared queue policies in the queues
+	// registry. A queue not yet registered is inserted; an identical
+	// redeclaration is a no-op; a DIFFERENT policy for a registered queue
+	// fails with an error matching ErrQueueConflict (drift guard).
+	RegisterQueues(ctx context.Context, queues []QueuePolicy) error
+
+	// Queues lists every registered queue policy (tools/UI/introspection).
+	Queues(ctx context.Context) ([]QueuePolicy, error)
+
+	// SetQueuePolicy deliberately overwrites (or creates) one registered
+	// queue policy — the explicit ops action for changing a policy;
+	// managers still running the old declaration will then fail their
+	// next registration check.
+	SetQueuePolicy(ctx context.Context, q QueuePolicy) error
+
+	// EnsureMetrics prepares metrics storage (indexes incl. the retention
+	// TTL). Called once by the janitor when metrics are enabled; a changed
+	// retention updates the TTL in place.
+	EnsureMetrics(ctx context.Context, retention time.Duration) error
+
+	// SnapshotMetrics computes and stores one cluster-wide gauges document
+	// per queue for the window starting at windowStart (status counts +
+	// oldest DUE-task age). Managers race per window; the first insert
+	// wins and the rest are silently skipped.
+	SnapshotMetrics(ctx context.Context, queues []string, windowStart time.Time, window time.Duration) error
+
+	// RecordCounters stores one document per queue with this manager
+	// instance's exact throughput counters for the window (no dedup —
+	// every manager writes its own; readers sum across managers).
+	RecordCounters(ctx context.Context, managerID string, windowStart time.Time, window time.Duration, counters map[string]QueueCounters) error
 
 	// ReapExpired marks running tasks whose lease expired AND whose attempts
 	// are exhausted as dead (with a "lease expired" error entry), so dropped

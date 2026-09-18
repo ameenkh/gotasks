@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -61,7 +62,7 @@ func newScenario(t *testing.T, name string, opts ...gotasks.Option) *scenario {
 	collName := fmt.Sprintf("scenario_%s_%d", name, time.Now().UnixNano())
 	st, err := mongostore.New(ctx, uri,
 		mongostore.WithDatabase("gotasks_test"),
-		mongostore.WithCollection(collName),
+		mongostore.WithNamespace(collName),
 	)
 	if err != nil {
 		t.Skipf("no MongoDB at %s: %v", uri, err)
@@ -76,7 +77,7 @@ func newScenario(t *testing.T, name string, opts ...gotasks.Option) *scenario {
 		gotasks.WithWorkers(4),
 		gotasks.WithPollInterval(50 * time.Millisecond),
 		gotasks.WithLeaseTime(30 * time.Second),
-		gotasks.WithReapInterval(500 * time.Millisecond),
+		gotasks.WithJanitor(gotasks.JanitorConfig{ReapInterval: 500 * time.Millisecond}),
 		gotasks.WithBackoff(gotasks.FixedBackoff(100 * time.Millisecond)),
 	}
 	m, err := gotasks.New(st, append(base, opts...)...)
@@ -84,12 +85,14 @@ func newScenario(t *testing.T, name string, opts ...gotasks.Option) *scenario {
 		t.Fatalf("New: %v", err)
 	}
 
-	col := client.Database("gotasks_test").Collection(collName)
+	col := client.Database("gotasks_test").Collection(collName + "_tasks")
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = m.Close(ctx) // stops the pool and closes the store
 		_ = col.Drop(ctx)
+		_ = client.Database("gotasks_test").Collection(collName + "_queues").Drop(ctx)
+		_ = client.Database("gotasks_test").Collection(collName + "_metrics").Drop(ctx)
 		_ = client.Disconnect(ctx)
 	})
 	return &scenario{t: t, m: m, st: st, col: col}
@@ -630,5 +633,87 @@ func TestScenarioBatchFinalize(t *testing.T) {
 	}
 	if n := sc.count(bson.M{"status": "done", "attempts": bson.M{"$ne": 1}}); n != 0 {
 		t.Errorf("%d done tasks have attempts != 1", n)
+	}
+}
+
+// Scenario: metrics under a live stream. Contract: after drain + stop, the
+// summed counter documents equal the true totals exactly, and gauge
+// windows are deduplicated (one per queue+window despite two managers).
+func TestScenarioMetrics(t *testing.T) {
+	t.Parallel()
+	sc := newScenario(t, "metrics",
+		gotasks.WithJanitor(gotasks.JanitorConfig{
+			ReapInterval: 500 * time.Millisecond,
+			Metrics:      &gotasks.MetricsConfig{Interval: 2 * time.Second},
+		}),
+		gotasks.WithManagerName("scenario-a"),
+	)
+	ctx := context.Background()
+
+	var calls callCounter
+	err := gotasks.RegisterHandler(sc.m, "work",
+		func(ctx context.Context, task *gotasks.Task, p struct{ N int64 }) (any, error) {
+			calls.hit(task.ID)
+			return nil, nil
+		})
+	if err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+	sc.start()
+
+	enqueued := sc.produce(10*time.Millisecond, func(i int64) {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "default", "work", struct{ N int64 }{N: i}); err != nil {
+			t.Errorf("enqueue %d: %v", i, err)
+		}
+	})
+	sc.drain(30 * time.Second)
+	// Stop flushes the janitor's final counter window.
+	stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := sc.m.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	metricsCol := sc.col.Database().Collection(strings.TrimSuffix(sc.col.Name(), "_tasks") + "_metrics")
+	type row struct {
+		Queue       string    `bson:"queue"`
+		WindowStart time.Time `bson:"window_start"`
+		Kind        string    `bson:"kind"`
+		Enqueued    int64     `bson:"enqueued"`
+		CDone       int64     `bson:"c_done"`
+	}
+	cur, err := metricsCol.Find(ctx, bson.M{})
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	var rows []row
+	if err := cur.All(ctx, &rows); err != nil {
+		t.Fatalf("decode metrics: %v", err)
+	}
+	var sumEnq, sumDone int64
+	gaugeWindows := map[string]int{}
+	for _, r := range rows {
+		switch r.Kind {
+		case "counters":
+			sumEnq += r.Enqueued
+			sumDone += r.CDone
+		case "gauges":
+			gaugeWindows[r.Queue+"|"+r.WindowStart.String()]++
+		}
+	}
+	if sumEnq != enqueued || sumDone != enqueued {
+		t.Errorf("counter sums: enqueued=%d done=%d, want %d/%d", sumEnq, sumDone, enqueued, enqueued)
+	}
+	for w, n := range gaugeWindows {
+		if n != 1 {
+			t.Errorf("gauge window %s has %d docs, want 1 (dedup)", w, n)
+		}
+	}
+	if len(gaugeWindows) == 0 {
+		t.Error("no gauge windows recorded over a 30s run")
+	}
+	tasks, total := calls.total()
+	if tasks != enqueued || total != enqueued {
+		t.Errorf("executed %d/%d calls, want exactly-once for all %d", tasks, total, enqueued)
 	}
 }

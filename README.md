@@ -109,6 +109,39 @@ pending ──claim (atomic, +1 attempt, new lease)──▶ running ──ok─
 
 ## Queues and ordering
 
+## Metrics (Mongo-native, opt-in)
+
+```go
+gotasks.WithJanitor(gotasks.JanitorConfig{
+    // ReapInterval: 60 * time.Second, // stale-zombie sweep (default)
+    Metrics: &gotasks.MetricsConfig{Interval: time.Minute, Retention: 7 * 24 * time.Hour},
+})
+```
+
+The janitor (the reaper's grown-up form) writes two kinds of documents to the
+`{namespace}_metrics` collection — no Prometheus, no agents, the Mongo
+cluster is the single source of truth:
+
+- **gauges** — one doc per queue per window, cluster-wide (managers race;
+  the first insert wins): status counts plus `oldest_due_age_ms`, the
+  queue-health number (how long has the oldest DUE task been waiting — the
+  same signal as SQS's ApproximateAgeOfOldestMessage).
+- **counters** — one doc per manager instance per queue per window with
+  exact throughput (`enqueued`, `claimed`, `done`, `failed`, `dead`),
+  counted in-process; readers sum across managers. Manager identity is
+  dot-separated: `{WithManagerName}.{random}` per instance, workers lease
+  as `{managerID}.worker.{n}`.
+
+Metrics prune themselves via a TTL index (Retention). Off by default.
+
+Declared queues are recorded in a **queues registry** (a sibling
+`<tasks>_queues` collection): the first declaration registers a queue's
+policy, an identical redeclaration is a no-op, and a manager declaring
+**different** settings for a registered queue fails fast with
+`ErrQueueConflict` — policy drift across producer/consumer deployments is
+a startup error, never silent behavior. Deliberate changes go through
+`Store.SetQueuePolicy`; `Store.Queues(ctx)` lists the registry.
+
 Queues use explicit subscription, like every queue system: tasks carry a
 queue label (`gotasks.WithQueue("emails")` at enqueue; `"default"`
 otherwise), and a manager consumes **exactly the queues it declares** —

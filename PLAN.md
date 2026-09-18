@@ -303,6 +303,60 @@ Module: `github.com/ameenkh/gotasks`
       WithQueue(QueuePolicy) — no WithQueue(QueuePolicy{...}) stutter, one
       declaration site, still appendable across calls.
 
+## Road to v1.0 (direction set by Ameen, 2026-09-18)
+
+Identity: pure Go + MongoDB — the whole framework, including operations
+and visibility, runs on nothing but a Go binary and a Mongo cluster
+(the Oban Web / River UI model, which no one has built for Mongo).
+
+- [x] 1. Queues registry — implemented 2026-09-18 (no split required — decided 2026-09-18 to keep
+      Manager and go straight for the UI path, since the UI binds to the
+      schema/store, not the Manager API): the manager upserts its declared
+      QueuePolicys into the queues collection at startup and validates
+      against it — policy drift across pods becomes a startup error, the
+      UI gets its queue inventory (incl. empty queues + policies), and the
+      collection is the future home of pause/resume + dynamic policy.
+      Implementation: Store gains RegisterQueues (insert-if-absent /
+      no-op-if-identical / ErrQueueConflict-if-different, insert race
+      resolved by re-read), Queues (list), SetQueuePolicy (deliberate
+      overwrite). Registry lives in "<tasks collection>_queues" keyed by
+      name; managers register lazily (first enqueue) and at Start, retried
+      until success. Producer/Consumer split DEFERRED and demoted to a
+      NON-BREAKING addition: introduce Producer (enqueue-only, zero goroutines) and
+      Consumer (consume + enqueue — task chains are core, a consumer that
+      cannot enqueue follow-ups is the trap) later, with Manager kept
+      forever as the facade composing both.
+- [x] 2. Janitor + Mongo-native metrics — implemented 2026-09-19. Reaper
+      became janitorLoop (per-duty clocks: reap on ReapInterval, metrics
+      on wall-clock-aligned windows). CORRECTION to the original sketch:
+      regular collection "<tasks>_metrics", NOT a time-series collection
+      (TS collections don't support the unique index the dedup needs).
+      Two doc kinds: gauges (cluster-wide, one per queue+window via unique
+      {queue, window_start, kind, manager_id} insert-first-wins; 4 indexed
+      counts + oldest DUE age via one findOne — no $group scans) and
+      counters (exact per-manager-instance throughput from in-process
+      atomics, swap-reset per window, no dedup needed; drain-flushed on
+      Stop; throughput from gauge deltas would be WRONG under TTL purges,
+      hence exact counters). Manager identity: ManagerID =
+      {WithManagerName}.{rand} (dot-separated; workers {managerID}.worker.{n}) (Ameen: no "pod" vocabulary in a generic
+      library), also now prefixes leased_by worker ids — fixes worker-0
+      collisions across instances. OFF BY DEFAULT (Ameen: small projects
+      pay nothing; big pipelines opt in) via WithJanitor(JanitorConfig{ReapInterval,
+      NoReap, Metrics: &MetricsConfig{Interval (60s), Retention (7d, TTL
+      updated in place via collMod)}}) — JanitorConfig groups all duties
+      (Ameen); the loop stays a DEADLINE scheduler (sleep till earliest
+      duty deadline), not min-interval ticking, preserving metrics
+      wall-alignment with zero spurious wakeups. WithReapInterval and
+      WithMetrics removed.
+      oldest_due_age kept after challenge: it is THE queue-health alert
+      signal (SQS ApproximateAgeOfOldestMessage), measured over DUE tasks
+      only so scheduled tasks don't read as stale.
+- [ ] 3. UI: embeddable http.Handler (go:embed frontend + JSON API over
+      tasks/queues/metrics) mounted in the user's own service behind
+      their auth, plus a standalone cmd binary. Requeue/delete/inspect
+      first; charts from the metrics collection. Auth is explicitly the
+      host app's responsibility.
+
 ## v1.0 — Ecosystem
 
 - [ ] Hooks/middleware (OnClaim/OnComplete/OnFail/OnDead)

@@ -27,7 +27,7 @@ import (
 
 type config struct {
 	database     string
-	collection   string
+	namespace    string
 	enqueueChunk int
 	ping         bool
 }
@@ -38,8 +38,10 @@ type Option func(*config)
 // WithDatabase sets the database name (default "gotasks").
 func WithDatabase(name string) Option { return func(c *config) { c.database = name } }
 
-// WithCollection sets the tasks collection name (default "tasks").
-func WithCollection(name string) Option { return func(c *config) { c.collection = name } }
+// WithNamespace sets the collection namespace (default "gotasks"): the
+// store uses "{namespace}_tasks", "{namespace}_queues" and
+// "{namespace}_metrics".
+func WithNamespace(name string) Option { return func(c *config) { c.namespace = name } }
 
 // WithEnqueueChunkSize sets how many tasks a single batch-enqueue insert
 // carries (default 1000). Bigger batches are written chunk by chunk, so a
@@ -52,7 +54,9 @@ func WithPing(ping bool) Option { return func(c *config) { c.ping = ping } }
 // Store is the MongoDB-backed gotasks.Store.
 type Store struct {
 	client       *mongo.Client
-	col          *mongo.Collection
+	tasksCol     *mongo.Collection // "{namespace}_tasks"
+	queuesCol    *mongo.Collection // "{namespace}_queues"
+	metricsCol   *mongo.Collection // "{namespace}_metrics"
 	enqueueChunk int
 	ownsClient   bool
 }
@@ -88,7 +92,7 @@ func FromClient(ctx context.Context, client *mongo.Client, opts ...Option) (*Sto
 }
 
 func defaults(opts []Option) config {
-	cfg := config{database: "gotasks", collection: "tasks", enqueueChunk: 1000, ping: true}
+	cfg := config{database: "gotasks", namespace: "gotasks", enqueueChunk: 1000, ping: true}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -101,7 +105,9 @@ func build(ctx context.Context, client *mongo.Client, cfg config) (*Store, error
 	}
 	s := &Store{
 		client:       client,
-		col:          client.Database(cfg.database).Collection(cfg.collection),
+		tasksCol:     client.Database(cfg.database).Collection(cfg.namespace + "_tasks"),
+		queuesCol:    client.Database(cfg.database).Collection(cfg.namespace + "_queues"),
+		metricsCol:   client.Database(cfg.database).Collection(cfg.namespace + "_metrics"),
 		enqueueChunk: cfg.enqueueChunk,
 	}
 	if err := s.ensureIndexes(ctx); err != nil {
@@ -144,7 +150,7 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 		// candidate _ids instead, so token lookups never need one (pre-v0.4
 		// deployments can drop the leftover "lease_token_1" index).
 	}
-	_, err := s.col.Indexes().CreateMany(ctx, indexes)
+	_, err := s.tasksCol.Indexes().CreateMany(ctx, indexes)
 	return err
 }
 
@@ -278,7 +284,7 @@ func (s *Store) Enqueue(ctx context.Context, tasks []*gotasks.Task) ([]string, e
 	}
 	for start := 0; start < len(docs); start += s.enqueueChunk {
 		end := min(start+s.enqueueChunk, len(docs))
-		_, err := s.col.InsertMany(ctx, docs[start:end], options.InsertMany().SetOrdered(false))
+		_, err := s.tasksCol.InsertMany(ctx, docs[start:end], options.InsertMany().SetOrdered(false))
 		if err == nil {
 			continue
 		}
@@ -328,7 +334,7 @@ func (s *Store) duplicateError(ctx context.Context, tasks []*gotasks.Task) error
 	}
 	dup := &gotasks.DuplicateTaskError{Key: key}
 	var doc taskDoc
-	if err := s.col.FindOne(ctx, bson.M{"unique_key": key}).Decode(&doc); err == nil {
+	if err := s.tasksCol.FindOne(ctx, bson.M{"unique_key": key}).Decode(&doc); err == nil {
 		dup.ExistingID = doc.ID.Hex()
 	}
 	return dup
@@ -378,7 +384,7 @@ func (s *Store) Claim(ctx context.Context, claim gotasks.ClaimOptions) (*gotasks
 	}
 
 	var doc taskDoc
-	err := s.col.FindOneAndUpdate(ctx,
+	err := s.tasksCol.FindOneAndUpdate(ctx,
 		runnableFilter(now, claim.Types, claim.Queues),
 		claimUpdate(now, claim.WorkerID, uuid.NewString(), claim.Lease),
 		opts).Decode(&doc)
@@ -407,7 +413,7 @@ func (s *Store) ClaimBatch(ctx context.Context, claim gotasks.ClaimOptions, k in
 	if claim.FIFO {
 		findOpts = findOpts.SetSort(claimSort)
 	}
-	cur, err := s.col.Find(ctx, runnableFilter(now, claim.Types, claim.Queues), findOpts)
+	cur, err := s.tasksCol.Find(ctx, runnableFilter(now, claim.Types, claim.Queues), findOpts)
 	if err != nil {
 		return nil, fmt.Errorf("mongostore: claim batch find: %w", err)
 	}
@@ -428,7 +434,7 @@ func (s *Store) ClaimBatch(ctx context.Context, claim gotasks.ClaimOptions, k in
 	token := uuid.NewString()
 	guard := runnableFilter(now, nil, nil) // ids are already type/queue-filtered
 	guard["_id"] = bson.M{"$in": ids}
-	res, err := s.col.UpdateMany(ctx, guard, claimUpdate(now, claim.WorkerID, token, claim.Lease))
+	res, err := s.tasksCol.UpdateMany(ctx, guard, claimUpdate(now, claim.WorkerID, token, claim.Lease))
 	if err != nil {
 		return nil, fmt.Errorf("mongostore: claim batch update: %w", err)
 	}
@@ -438,7 +444,7 @@ func (s *Store) ClaimBatch(ctx context.Context, claim gotasks.ClaimOptions, k in
 
 	// Winners are a subset of the candidates, so target their _ids (point
 	// lookups) and filter by token — no lease_token index needed.
-	won, err := s.col.Find(ctx, bson.M{"_id": bson.M{"$in": ids}, "lease_token": token})
+	won, err := s.tasksCol.Find(ctx, bson.M{"_id": bson.M{"$in": ids}, "lease_token": token})
 	if err != nil {
 		return nil, fmt.Errorf("mongostore: claim batch fetch: %w", err)
 	}
@@ -495,7 +501,7 @@ func (s *Store) Complete(ctx context.Context, t *gotasks.Task, result json.RawMe
 	if err != nil {
 		return err
 	}
-	res, err := s.col.UpdateOne(ctx, filter, update)
+	res, err := s.tasksCol.UpdateOne(ctx, filter, update)
 	if err != nil {
 		return fmt.Errorf("mongostore: complete: %w", err)
 	}
@@ -534,7 +540,7 @@ func (s *Store) Fail(ctx context.Context, t *gotasks.Task, taskErr gotasks.TaskE
 	if err != nil {
 		return err
 	}
-	res, err := s.col.UpdateOne(ctx, filter, update)
+	res, err := s.tasksCol.UpdateOne(ctx, filter, update)
 	if err != nil {
 		return fmt.Errorf("mongostore: fail: %w", err)
 	}
@@ -566,7 +572,7 @@ func (s *Store) FinalizeBatch(ctx context.Context, outcomes []gotasks.Outcome) (
 		}
 		models = append(models, mongo.NewUpdateOneModel().SetFilter(filter).SetUpdate(update))
 	}
-	res, err := s.col.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	res, err := s.tasksCol.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
 	if err != nil {
 		return 0, fmt.Errorf("mongostore: finalize batch: %w", err)
 	}
@@ -580,7 +586,7 @@ func (s *Store) ExtendLease(ctx context.Context, t *gotasks.Task, lease time.Dur
 	}
 	now := time.Now().UTC()
 	until := now.Add(lease)
-	res, err := s.col.UpdateOne(ctx, leaseFilter(o, t.LeaseToken),
+	res, err := s.tasksCol.UpdateOne(ctx, leaseFilter(o, t.LeaseToken),
 		bson.M{"$set": bson.M{"leased_until": until, "updated_at": now}})
 	if err != nil {
 		return time.Time{}, fmt.Errorf("mongostore: extend lease: %w", err)
@@ -608,7 +614,7 @@ func (s *Store) Requeue(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	res, err := s.col.UpdateOne(ctx,
+	res, err := s.tasksCol.UpdateOne(ctx,
 		bson.M{"_id": o, "status": string(gotasks.StatusDead)},
 		requeueUpdate(time.Now().UTC()))
 	if err != nil {
@@ -625,7 +631,7 @@ func (s *Store) RequeueDead(ctx context.Context, taskType string) (int64, error)
 	if taskType != "" {
 		filter["type"] = taskType
 	}
-	res, err := s.col.UpdateMany(ctx, filter, requeueUpdate(time.Now().UTC()))
+	res, err := s.tasksCol.UpdateMany(ctx, filter, requeueUpdate(time.Now().UTC()))
 	if err != nil {
 		return 0, fmt.Errorf("mongostore: requeue dead: %w", err)
 	}
@@ -654,7 +660,7 @@ func (s *Store) ReapExpired(ctx context.Context) (int64, error) {
 	}
 	// Pipeline update so each reaped task's error entry records its own
 	// attempts/worker fields.
-	res, err := s.col.UpdateMany(ctx, filter, mongo.Pipeline{
+	res, err := s.tasksCol.UpdateMany(ctx, filter, mongo.Pipeline{
 		{{Key: "$set", Value: set}},
 		{{Key: "$unset", Value: bson.A{"leased_by", "lease_token", "unique_key"}}},
 	})
@@ -664,10 +670,17 @@ func (s *Store) ReapExpired(ctx context.Context) (int64, error) {
 	return res.ModifiedCount, nil
 }
 
-// DropCollection drops the underlying tasks collection — a helper for
-// tests and benchmarks; production cleanup should use retention TTLs.
+// DropCollection drops the underlying tasks collection and its sibling
+// queues registry — a helper for tests and benchmarks; production cleanup
+// should use queue TTLs.
 func (s *Store) DropCollection(ctx context.Context) error {
-	return s.col.Drop(ctx)
+	if err := s.tasksCol.Drop(ctx); err != nil {
+		return err
+	}
+	if err := s.queuesCol.Drop(ctx); err != nil {
+		return err
+	}
+	return s.metricsCol.Drop(ctx)
 }
 
 func (s *Store) Close(ctx context.Context) error {

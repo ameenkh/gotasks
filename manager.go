@@ -3,6 +3,7 @@ package gotasks
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,13 @@ type Manager struct {
 	types      []string // registered handler types; claims are restricted to these
 	queueNames []string
 	queues     map[string]QueuePolicy
+	managerID  string
+	counters   map[string]*queueCounters // per declared queue, atomic
+
+	// Queues-registry registration: lazy (Enqueue needs it in produce-only
+	// managers that never Start), retried until it succeeds once.
+	regMu      sync.Mutex
+	registered bool
 
 	started     atomic.Bool
 	runCtx      context.Context    // cancelled only on hard stop; parent of handler contexts
@@ -60,6 +68,23 @@ type Manager struct {
 	finMargin   time.Duration
 	workerWg    sync.WaitGroup
 	workersDone chan struct{}
+}
+
+// queueCounters are one queue's atomic event counts since the last metrics
+// flush (see Store.QueueCounters).
+type queueCounters struct {
+	enqueued, claimed, done, failed, dead atomic.Int64
+}
+
+// count adds to one queue's counter via a picker; no-op when metrics are
+// off or the queue is unknown (foreign-queue tasks can't occur by design).
+func (m *Manager) count(queue string, pick func(*queueCounters) *atomic.Int64, n int64) {
+	if m.counters == nil {
+		return
+	}
+	if c, ok := m.counters[queue]; ok {
+		pick(c).Add(n)
+	}
 }
 
 // broadcaster fans one nudge out to every waiter (single mode has N idle
@@ -96,7 +121,6 @@ func New(store Store, opts ...Option) (*Manager, error) {
 		DefaultMaxAttempts: 3,
 		DefaultTimeout:     60 * time.Second,
 		Backoff:            ExponentialBackoff(30*time.Second, time.Hour),
-		ReapInterval:       60 * time.Second,
 		FallbackPoll:       30 * time.Second,
 	}
 	for _, o := range opts {
@@ -171,8 +195,42 @@ func New(store Store, opts ...Option) (*Manager, error) {
 			}
 		}
 	}
+	if cfg.ManagerName == "" {
+		cfg.ManagerName = "manager"
+	}
+	if cfg.Janitor.ReapInterval == 0 {
+		cfg.Janitor.ReapInterval = 60 * time.Second
+	}
+	if cfg.Janitor.ReapInterval < 0 {
+		return nil, errors.New("gotasks: Janitor.ReapInterval must be > 0 (disable with NoReap)")
+	}
+	if mc := cfg.Janitor.Metrics; mc != nil {
+		if mc.Interval == 0 {
+			mc.Interval = time.Minute
+		}
+		if mc.Interval < time.Second {
+			return nil, errors.New("gotasks: Metrics.Interval must be >= 1s")
+		}
+		if mc.Retention == 0 {
+			mc.Retention = 7 * 24 * time.Hour
+		}
+		if mc.Retention < time.Minute {
+			return nil, errors.New("gotasks: Metrics.Retention must be >= 1m")
+		}
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	suffix := make([]byte, 4)
+	if _, err := rand.Read(suffix); err != nil {
+		return nil, fmt.Errorf("gotasks: manager id: %w", err)
+	}
+	var counters map[string]*queueCounters
+	if cfg.Janitor.Metrics != nil {
+		counters = make(map[string]*queueCounters, len(queueNames))
+		for _, q := range queueNames {
+			counters[q] = &queueCounters{}
+		}
 	}
 	return &Manager{
 		store:      store,
@@ -180,6 +238,8 @@ func New(store Store, opts ...Option) (*Manager, error) {
 		handlers:   map[string]handlerEntry{},
 		queueNames: queueNames,
 		queues:     queues,
+		managerID:  fmt.Sprintf("%s.%x", cfg.ManagerName, suffix),
+		counters:   counters,
 	}, nil
 }
 
@@ -211,6 +271,9 @@ func EnqueueMany[T any](ctx context.Context, m *Manager, queue, taskType string,
 	qp, declared := m.queues[queue]
 	if !declared {
 		return nil, fmt.Errorf("gotasks: queue %q is not declared on this manager (WithQueues)", queue)
+	}
+	if err := m.ensureRegistered(ctx); err != nil {
+		return nil, err
 	}
 	if len(payloads) == 0 {
 		return nil, nil
@@ -268,7 +331,15 @@ func EnqueueMany[T any](ctx context.Context, m *Manager, queue, taskType string,
 			UpdatedAt:   now,
 		}
 	}
-	return m.store.Enqueue(ctx, tasks)
+	ids, err := m.store.Enqueue(ctx, tasks)
+	var inserted int64
+	for _, id := range ids {
+		if id != "" {
+			inserted++
+		}
+	}
+	m.count(queue, func(c *queueCounters) *atomic.Int64 { return &c.enqueued }, inserted)
+	return ids, err
 }
 
 // marshalPayload enforces the object-or-nothing payload contract so every
@@ -336,6 +407,21 @@ func RegisterHandler[T any](m *Manager, taskType string, fn func(ctx context.Con
 	return nil
 }
 
+// ensureRegistered records this manager's queue declarations in the store's
+// queues registry (once), failing on policy drift (ErrQueueConflict).
+func (m *Manager) ensureRegistered(ctx context.Context) error {
+	m.regMu.Lock()
+	defer m.regMu.Unlock()
+	if m.registered {
+		return nil
+	}
+	if err := m.store.RegisterQueues(ctx, m.cfg.Queues); err != nil {
+		return err
+	}
+	m.registered = true
+	return nil
+}
+
 // claimOptions builds the ClaimOptions shared by all claim call sites.
 func (m *Manager) claimOptions(workerID string, lease time.Duration) ClaimOptions {
 	return ClaimOptions{
@@ -380,6 +466,13 @@ func (m *Manager) Start() error {
 	if !m.started.CompareAndSwap(false, true) {
 		return errors.New("gotasks: already started")
 	}
+	regCtx, regCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := m.ensureRegistered(regCtx)
+	regCancel()
+	if err != nil {
+		m.started.Store(false)
+		return err
+	}
 	m.types = make([]string, 0, len(m.handlers))
 	for t := range m.handlers {
 		m.types = append(m.types, t)
@@ -420,7 +513,7 @@ func (m *Manager) Start() error {
 			go func(id string) {
 				defer m.workerWg.Done()
 				m.batchWorkerLoop(id)
-			}(fmt.Sprintf("worker-%d", i))
+			}(fmt.Sprintf("%s.worker.%d", m.managerID, i))
 		}
 	} else {
 		// Single mode: workers claim directly, no fetcher, no handshake.
@@ -449,7 +542,7 @@ func (m *Manager) Start() error {
 			go func(id string) {
 				defer m.workerWg.Done()
 				m.workerLoop(id)
-			}(fmt.Sprintf("worker-%d", i))
+			}(fmt.Sprintf("%s.worker.%d", m.managerID, i))
 		}
 	}
 	if m.finalizeOn() {
@@ -462,12 +555,12 @@ func (m *Manager) Start() error {
 		}()
 		go m.flusherLoop()
 	}
-	if m.cfg.ReapInterval > 0 {
+	if !m.cfg.Janitor.NoReap || m.cfg.Janitor.Metrics != nil {
 		m.wg.Add(1)
-		go m.reaperLoop()
+		go m.janitorLoop()
 	}
 	m.cfg.Logger.Info("gotasks: started",
-		"workers", m.cfg.Workers, "pipeline", m.cfg.Pipeline != nil,
+		"manager_id", m.managerID, "workers", m.cfg.Workers, "pipeline", m.cfg.Pipeline != nil,
 		"change_stream", m.watchCh != nil, "types", m.types)
 	return nil
 }

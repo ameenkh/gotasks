@@ -16,7 +16,10 @@ import (
 type fakeStore struct {
 	mu    sync.Mutex
 	seq   int
-	tasks map[string]*Task
+	tasks     map[string]*Task
+	registry  map[string]QueuePolicy
+	metrics   []fakeMetric
+	gaugeKeys map[string]bool
 
 	// forceLeaseLost makes ExtendLease report ErrLeaseLost, simulating the
 	// task having been reclaimed while its handler runs.
@@ -24,7 +27,39 @@ type fakeStore struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{tasks: map[string]*Task{}}
+	return &fakeStore{tasks: map[string]*Task{}, registry: map[string]QueuePolicy{}, gaugeKeys: map[string]bool{}}
+}
+
+func (s *fakeStore) RegisterQueues(_ context.Context, queues []QueuePolicy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, q := range queues {
+		if existing, ok := s.registry[q.Name]; ok {
+			if existing.TTL != q.TTL || existing.MaxAttempts != q.MaxAttempts {
+				return fmt.Errorf("%w: queue %q", ErrQueueConflict, q.Name)
+			}
+			continue
+		}
+		s.registry[q.Name] = q
+	}
+	return nil
+}
+
+func (s *fakeStore) Queues(context.Context) ([]QueuePolicy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]QueuePolicy, 0, len(s.registry))
+	for _, q := range s.registry {
+		out = append(out, q)
+	}
+	return out, nil
+}
+
+func (s *fakeStore) SetQueuePolicy(_ context.Context, q QueuePolicy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.registry[q.Name] = q
+	return nil
 }
 
 func cloneTask(t *Task) *Task {
@@ -259,6 +294,61 @@ func (s *fakeStore) ReapExpired(_ context.Context) (int64, error) {
 		}
 	}
 	return n, nil
+}
+
+type fakeMetric struct {
+	queue       string
+	windowStart time.Time
+	managerID   string // "" = gauges
+	gauges      map[Status]int64
+	counters    QueueCounters
+}
+
+func (s *fakeStore) EnsureMetrics(context.Context, time.Duration) error { return nil }
+
+func (s *fakeStore) SnapshotMetrics(_ context.Context, queues []string, windowStart time.Time, _ time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, q := range queues {
+		key := q + "|" + windowStart.String()
+		if s.gaugeKeys[key] {
+			continue // dedup: first snapshot wins
+		}
+		s.gaugeKeys[key] = true
+		g := map[Status]int64{}
+		for _, t := range s.tasks {
+			if t.Queue == q {
+				g[t.Status]++
+			}
+		}
+		s.metrics = append(s.metrics, fakeMetric{queue: q, windowStart: windowStart, gauges: g})
+	}
+	return nil
+}
+
+func (s *fakeStore) RecordCounters(_ context.Context, managerID string, windowStart time.Time, _ time.Duration, counters map[string]QueueCounters) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for q, c := range counters {
+		s.metrics = append(s.metrics, fakeMetric{queue: q, windowStart: windowStart, managerID: managerID, counters: c})
+	}
+	return nil
+}
+
+func (s *fakeStore) counterTotals(queue string) QueueCounters {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out QueueCounters
+	for _, mtr := range s.metrics {
+		if mtr.managerID != "" && mtr.queue == queue {
+			out.Enqueued += mtr.counters.Enqueued
+			out.Claimed += mtr.counters.Claimed
+			out.Done += mtr.counters.Done
+			out.Failed += mtr.counters.Failed
+			out.Dead += mtr.counters.Dead
+		}
+	}
+	return out
 }
 
 func (s *fakeStore) Close(context.Context) error { return nil }

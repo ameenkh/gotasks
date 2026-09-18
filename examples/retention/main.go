@@ -27,7 +27,7 @@ func main() {
 
 	store, err := mongostore.New(ctx, "mongodb://localhost:27017",
 		mongostore.WithDatabase("gotasks_examples"),
-		mongostore.WithCollection("ttl"),
+		mongostore.WithNamespace("ttl"),
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -79,7 +79,7 @@ func main() {
 	fmt.Println("  audit  #3 -> never (queue TTL 0)")
 	fmt.Println()
 	fmt.Println("inspect with: mongosh gotasks_examples --eval \\")
-	fmt.Println("  'db.ttl.find({},{queue:1,status:1,expires_at:1})'")
+	fmt.Println("  'db.ttl_tasks.find({},{queue:1,status:1,expires_at:1})'")
 	fmt.Println("(MongoDB's TTL monitor runs about once a minute — and it will")
 	fmt.Println(" purge a task whose TTL passes even if it was never consumed)")
 

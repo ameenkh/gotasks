@@ -24,9 +24,10 @@ type Config struct {
 	DefaultTimeout time.Duration
 	// Backoff computes retry delays. Default ExponentialBackoff(30s, 1h).
 	Backoff Backoff
-	// ReapInterval is how often stale+exhausted tasks are swept to dead.
-	// 0 disables the reaper. Default 60s.
-	ReapInterval time.Duration
+	// Janitor configures the maintenance goroutine's duties (reaping,
+	// metrics, future work). The zero value is a working default: reap
+	// every 60s, metrics off. See WithJanitor.
+	Janitor JanitorConfig
 	// HeartbeatInterval controls automatic lease extension while a handler
 	// runs, letting handlers outlive LeaseTime without being reclaimed.
 	// 0 (default) disables the heartbeat — handlers must then finish within
@@ -64,8 +65,40 @@ type Config struct {
 	// calls Start; an app producing to A while consuming B uses two
 	// managers).
 	Queues []QueuePolicy
+	// ManagerName is a developer-chosen, non-unique label for this manager
+	// instance (default "manager"). The framework derives a unique,
+	// dot-separated ManagerID = "{name}.{random}" per instance; workers
+	// lease as "{managerID}.worker.{n}" (fetcher: "{managerID}.fetcher"),
+	// and metrics counters are attributed to the ManagerID.
+	ManagerName string
 	// Logger receives worker/reaper diagnostics. Default slog.Default().
 	Logger *slog.Logger
+}
+
+// JanitorConfig groups the janitor's duties. The janitor itself is a
+// deadline scheduler — every duty keeps its own clock, and the goroutine
+// sleeps until the earliest next deadline (no fixed tick, no drift on the
+// wall-aligned metrics windows).
+type JanitorConfig struct {
+	// ReapInterval is how often stale+exhausted tasks are swept to dead.
+	// 0 = default 60s; disable with NoReap.
+	ReapInterval time.Duration
+	// NoReap disables the reap duty (zombies then stay visible as running
+	// docs with expired leases).
+	NoReap bool
+	// Metrics enables the metrics duty when non-nil. nil (default) = off:
+	// smaller projects pay nothing.
+	Metrics *MetricsConfig
+}
+
+// MetricsConfig configures Mongo-native metrics (see JanitorConfig). Zero
+// values take defaults.
+type MetricsConfig struct {
+	// Interval is the snapshot window size (default 60s, min 1s).
+	Interval time.Duration
+	// Retention is how long metrics documents are kept (TTL index on the
+	// metrics collection; default 7 days).
+	Retention time.Duration
 }
 
 // Option configures the Manager.
@@ -77,7 +110,6 @@ func WithLeaseTime(d time.Duration) Option      { return func(c *Config) { c.Lea
 func WithDefaultMaxAttempts(n int) Option       { return func(c *Config) { c.DefaultMaxAttempts = n } }
 func WithDefaultTimeout(d time.Duration) Option { return func(c *Config) { c.DefaultTimeout = d } }
 func WithBackoff(b Backoff) Option              { return func(c *Config) { c.Backoff = b } }
-func WithReapInterval(d time.Duration) Option   { return func(c *Config) { c.ReapInterval = d } }
 func WithLogger(l *slog.Logger) Option          { return func(c *Config) { c.Logger = l } }
 
 // HeartbeatAuto selects the automatic heartbeat cadence: LeaseTime/3.
@@ -93,6 +125,20 @@ func WithoutChangeStream() Option {
 // stream is active (see Config.FallbackPoll).
 func WithFallbackPoll(d time.Duration) Option {
 	return func(c *Config) { c.FallbackPoll = d }
+}
+
+// WithManagerName sets the developer-chosen label for this manager
+// instance (see Config.ManagerName).
+func WithManagerName(name string) Option {
+	return func(c *Config) { c.ManagerName = name }
+}
+
+// WithJanitor configures the maintenance duties (last call wins whole).
+// Metrics duty: per-window gauge snapshots per queue (status counts +
+// oldest due-task age; deduplicated cluster-wide, first manager wins each
+// window) and this manager's exact per-queue throughput counters.
+func WithJanitor(jc JanitorConfig) Option {
+	return func(c *Config) { c.Janitor = jc }
 }
 
 // WithFIFO makes claims take the oldest runnable task first (see

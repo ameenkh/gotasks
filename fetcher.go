@@ -2,6 +2,7 @@ package gotasks
 
 import (
 	"errors"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,10 +34,11 @@ func (m *Manager) fetcherLoop() {
 		}
 
 		k := min(m.cfg.Pipeline.ClaimBatch, free)
-		tasks, err := m.store.ClaimBatch(m.claimCtx, m.claimOptions("fetcher", queueLease), k)
+		tasks, err := m.store.ClaimBatch(m.claimCtx, m.claimOptions(m.managerID+".fetcher", queueLease), k)
 		switch {
 		case err == nil:
 			for _, t := range tasks {
+				m.count(t.Queue, func(c *queueCounters) *atomic.Int64 { return &c.claimed }, 1)
 				select {
 				case m.taskCh <- t:
 				case <-m.claimCtx.Done():

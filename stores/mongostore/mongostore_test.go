@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ameenkh/gotasks"
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 func testStore(t *testing.T) *Store {
@@ -28,7 +29,7 @@ func testStore(t *testing.T) *Store {
 	coll := fmt.Sprintf("tasks_test_%d", time.Now().UnixNano())
 	s, err := New(ctx, uri,
 		WithDatabase("gotasks_test"),
-		WithCollection(coll),
+		WithNamespace(coll),
 	)
 	if err != nil {
 		t.Skipf("no MongoDB at %s: %v", uri, err)
@@ -36,7 +37,8 @@ func testStore(t *testing.T) *Store {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = s.col.Drop(ctx)
+		_ = s.tasksCol.Drop(ctx)
+		_ = s.queuesCol.Drop(ctx)
 		_ = s.Close(ctx)
 	})
 	return s
@@ -201,7 +203,7 @@ func TestStaleReclaimRespectsMaxAttempts(t *testing.T) {
 	}
 	var doc taskDoc
 	oidOnce, _ := oid(once)
-	if err := s.col.FindOne(ctx, map[string]any{"_id": oidOnce}).Decode(&doc); err != nil {
+	if err := s.tasksCol.FindOne(ctx, map[string]any{"_id": oidOnce}).Decode(&doc); err != nil {
 		t.Fatalf("find reaped: %v", err)
 	}
 	if doc.Status != string(gotasks.StatusDead) || len(doc.Errors) != 1 {
@@ -327,7 +329,7 @@ func TestRequeueDeadTask(t *testing.T) {
 	// requeue must NOT have touched it (nil here, since no TTL was set).
 	var doc taskDoc
 	o, _ := oid(id)
-	if err := s.col.FindOne(ctx, map[string]any{"_id": o}).Decode(&doc); err != nil {
+	if err := s.tasksCol.FindOne(ctx, map[string]any{"_id": o}).Decode(&doc); err != nil {
 		t.Fatalf("find: %v", err)
 	}
 	if doc.ExpiresAt != nil {
@@ -672,7 +674,7 @@ func TestFinalizeBatchMixedOutcomes(t *testing.T) {
 	// Simulate the stale case: rotate staleID's token via reclaim before
 	// the flush lands.
 	staleTask := byID[staleID]
-	if _, err := s.col.UpdateOne(ctx,
+	if _, err := s.tasksCol.UpdateOne(ctx,
 		map[string]any{"_id": mustOID(t, staleID)},
 		map[string]any{"$set": map[string]any{"lease_token": "rotated-elsewhere"}}); err != nil {
 		t.Fatalf("rotate token: %v", err)
@@ -694,7 +696,7 @@ func TestFinalizeBatchMixedOutcomes(t *testing.T) {
 
 	check := func(id string, want gotasks.Status) *taskDoc {
 		var doc taskDoc
-		if err := s.col.FindOne(ctx, map[string]any{"_id": mustOID(t, id)}).Decode(&doc); err != nil {
+		if err := s.tasksCol.FindOne(ctx, map[string]any{"_id": mustOID(t, id)}).Decode(&doc); err != nil {
 			t.Fatalf("find %s: %v", id, err)
 		}
 		if doc.Status != string(want) {
@@ -731,7 +733,7 @@ func TestEnqueueManyChunked(t *testing.T) {
 	coll := fmt.Sprintf("tasks_test_chunk_%d", time.Now().UnixNano())
 	s, err := New(ctx, uri,
 		WithDatabase("gotasks_test"),
-		WithCollection(coll),
+		WithNamespace(coll),
 		WithEnqueueChunkSize(100), // force 25 chunks
 	)
 	if err != nil {
@@ -739,7 +741,7 @@ func TestEnqueueManyChunked(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		bg := context.Background()
-		_ = s.col.Drop(bg)
+		_ = s.tasksCol.Drop(bg)
 		_ = s.Close(bg)
 	})
 
@@ -766,7 +768,7 @@ func TestEnqueueManyChunked(t *testing.T) {
 			t.Fatalf("id %d is empty on a fully successful batch", i)
 		}
 	}
-	n, err := s.col.CountDocuments(bg, map[string]any{"status": "pending"})
+	n, err := s.tasksCol.CountDocuments(bg, map[string]any{"status": "pending"})
 	if err != nil || n != total {
 		t.Fatalf("inserted %d docs, want %d (%v)", n, total, err)
 	}
@@ -816,7 +818,7 @@ func TestEnqueueManyPartialFailure(t *testing.T) {
 		}
 	}
 	// The other four really landed (5 docs total incl. the key holder).
-	n, _ := s.col.CountDocuments(ctx, map[string]any{"type": "job"})
+	n, _ := s.tasksCol.CountDocuments(ctx, map[string]any{"type": "job"})
 	if n != 5 {
 		t.Fatalf("collection has %d docs, want 5", n)
 	}
@@ -832,3 +834,166 @@ func TestEnqueueManyPartialFailure(t *testing.T) {
 	}
 }
 
+
+func TestQueueRegistry(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	policies := []gotasks.QueuePolicy{
+		{Name: "emails", TTL: time.Hour, MaxAttempts: 5},
+		{Name: "audit"}, // TTL 0, inherit attempts
+	}
+	if err := s.RegisterQueues(ctx, policies); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// Identical redeclaration is a no-op.
+	if err := s.RegisterQueues(ctx, policies); err != nil {
+		t.Fatalf("identical redeclaration: %v", err)
+	}
+	// Drift on TTL and on MaxAttempts both fail.
+	if err := s.RegisterQueues(ctx, []gotasks.QueuePolicy{{Name: "emails", TTL: 2 * time.Hour, MaxAttempts: 5}}); !errors.Is(err, gotasks.ErrQueueConflict) {
+		t.Fatalf("TTL drift: got %v, want ErrQueueConflict", err)
+	}
+	if err := s.RegisterQueues(ctx, []gotasks.QueuePolicy{{Name: "emails", TTL: time.Hour, MaxAttempts: 9}}); !errors.Is(err, gotasks.ErrQueueConflict) {
+		t.Fatalf("MaxAttempts drift: got %v, want ErrQueueConflict", err)
+	}
+
+	got, err := s.Queues(ctx)
+	if err != nil {
+		t.Fatalf("Queues: %v", err)
+	}
+	if len(got) != 2 || got[0].Name != "audit" || got[1].Name != "emails" ||
+		got[1].TTL != time.Hour || got[1].MaxAttempts != 5 {
+		t.Fatalf("registry contents wrong: %+v", got)
+	}
+
+	// Deliberate change via SetQueuePolicy; old declaration now conflicts,
+	// new one registers cleanly.
+	if err := s.SetQueuePolicy(ctx, gotasks.QueuePolicy{Name: "emails", TTL: 2 * time.Hour, MaxAttempts: 5}); err != nil {
+		t.Fatalf("SetQueuePolicy: %v", err)
+	}
+	if err := s.RegisterQueues(ctx, []gotasks.QueuePolicy{{Name: "emails", TTL: time.Hour, MaxAttempts: 5}}); !errors.Is(err, gotasks.ErrQueueConflict) {
+		t.Fatalf("old policy after change: got %v, want ErrQueueConflict", err)
+	}
+	if err := s.RegisterQueues(ctx, []gotasks.QueuePolicy{{Name: "emails", TTL: 2 * time.Hour, MaxAttempts: 5}}); err != nil {
+		t.Fatalf("new policy after change: %v", err)
+	}
+}
+
+func TestQueueRegistryConcurrentFirstRegistration(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	// Many managers race to register the same new queue: exactly one
+	// inserts, everyone must succeed (identical policies).
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = s.RegisterQueues(ctx, []gotasks.QueuePolicy{{Name: "raced", TTL: time.Minute}})
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("racer %d: %v", i, err)
+		}
+	}
+	got, _ := s.Queues(ctx)
+	if len(got) != 1 || got[0].Name != "raced" {
+		t.Fatalf("registry after race: %+v", got)
+	}
+}
+
+func TestMetricsSnapshotAndCounters(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if err := s.EnsureMetrics(ctx, time.Hour); err != nil {
+		t.Fatalf("EnsureMetrics: %v", err)
+	}
+	// State: 2 pending due (one old), 1 pending future, 1 running, 1 done.
+	old := enqueueOne(t, s, "job", `{"n":1}`, 3, now.Add(-90*time.Second))
+	_ = old
+	enqueueOne(t, s, "job", `{"n":2}`, 3, now)
+	enqueueOne(t, s, "job", `{"n":3}`, 3, now.Add(time.Hour)) // future: not "due"
+	enqueueOne(t, s, "job", `{"n":4}`, 3, now)
+	task := claimOne(t, s, "w1") // claims the oldest due
+	// complete one more
+	task2, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w1", Lease: time.Minute})
+	if err != nil {
+		t.Fatalf("claim2: %v", err)
+	}
+	if err := s.Complete(ctx, task2, nil); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	_ = task
+
+	window := now.Truncate(time.Minute)
+	if err := s.SnapshotMetrics(ctx, []string{"q1"}, window, time.Minute); err != nil {
+		t.Fatalf("SnapshotMetrics: %v", err)
+	}
+	// Dedup: second snapshot of the same window must not duplicate.
+	if err := s.SnapshotMetrics(ctx, []string{"q1"}, window, time.Minute); err != nil {
+		t.Fatalf("SnapshotMetrics again: %v", err)
+	}
+	var gauges []metricDoc
+	cur, _ := s.metricsCol.Find(ctx, bson.M{"kind": "gauges"})
+	if err := cur.All(ctx, &gauges); err != nil {
+		t.Fatalf("read gauges: %v", err)
+	}
+	if len(gauges) != 1 {
+		t.Fatalf("gauge docs = %d, want 1 (dedup)", len(gauges))
+	}
+	g := gauges[0]
+	if g.Pending != 2 || g.Running != 1 || g.Done != 1 || g.Dead != 0 {
+		t.Errorf("gauges = pending:%d running:%d done:%d dead:%d, want 2/1/1/0",
+			g.Pending, g.Running, g.Done, g.Dead)
+	}
+	if g.OldestDueAgeMS <= 0 {
+		t.Errorf("oldest_due_age_ms = %d, want > 0 (a due pending task exists)", g.OldestDueAgeMS)
+	}
+
+	// Counters: two managers write independently; totals sum.
+	c := map[string]gotasks.QueueCounters{"q1": {Enqueued: 5, Done: 3}}
+	if err := s.RecordCounters(ctx, "mgr-a", window, time.Minute, c); err != nil {
+		t.Fatalf("RecordCounters a: %v", err)
+	}
+	if err := s.RecordCounters(ctx, "mgr-b", window, time.Minute, c); err != nil {
+		t.Fatalf("RecordCounters b: %v", err)
+	}
+	n, err := s.metricsCol.CountDocuments(ctx, bson.M{"kind": "counters"})
+	if err != nil || n != 2 {
+		t.Fatalf("counter docs = %d (%v), want 2 (one per manager, no dedup)", n, err)
+	}
+}
+
+func TestEnsureMetricsRetentionChange(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if err := s.EnsureMetrics(ctx, time.Hour); err != nil {
+		t.Fatalf("EnsureMetrics: %v", err)
+	}
+	// Changed retention must update the TTL in place, not fail.
+	if err := s.EnsureMetrics(ctx, 2*time.Hour); err != nil {
+		t.Fatalf("EnsureMetrics with new retention: %v", err)
+	}
+	cur, _ := s.metricsCol.Indexes().List(ctx)
+	var specs []bson.M
+	_ = cur.All(ctx, &specs)
+	found := false
+	for _, sp := range specs {
+		if sp["name"] == "metrics_ttl" {
+			found = true
+			if secs, _ := sp["expireAfterSeconds"].(int32); secs != 7200 {
+				t.Errorf("ttl = %v, want 7200", sp["expireAfterSeconds"])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("metrics_ttl index missing")
+	}
+}

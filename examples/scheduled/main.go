@@ -24,7 +24,7 @@ func main() {
 
 	store, err := mongostore.New(ctx, "mongodb://localhost:27017",
 		mongostore.WithDatabase("gotasks_examples"),
-		mongostore.WithCollection("scheduled"),
+		mongostore.WithNamespace("scheduled"),
 	)
 	if err != nil {
 		log.Fatal(err)
