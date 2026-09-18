@@ -35,6 +35,7 @@ func main() {
 	}
 
 	m, err := gotasks.New(store,
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "orders"}),
 		gotasks.WithWorkers(2),
 		gotasks.WithPollInterval(100*time.Millisecond),
 	)
@@ -64,8 +65,8 @@ func main() {
 		{OrderID: "ord-1002", OK: false}, // -> dead letter, exactly one attempt
 	}
 	for _, o := range orders {
-		if _, err := gotasks.Enqueue(ctx, m, "provision", o,
-			gotasks.WithMaxAttempts(1)); err != nil {
+		if _, err := gotasks.Enqueue(ctx, m, "orders", "provision", o,
+			gotasks.TaskPolicy{MaxAttempts: 1}); err != nil {
 			log.Fatal(err)
 		}
 	}

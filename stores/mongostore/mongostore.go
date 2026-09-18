@@ -26,12 +26,10 @@ import (
 )
 
 type config struct {
-	database        string
-	collection      string
-	retention       time.Duration
-	retentionByType map[string]time.Duration
-	enqueueChunk    int
-	ping            bool
+	database     string
+	collection   string
+	enqueueChunk int
+	ping         bool
 }
 
 // Option configures the store.
@@ -43,18 +41,6 @@ func WithDatabase(name string) Option { return func(c *config) { c.database = na
 // WithCollection sets the tasks collection name (default "tasks").
 func WithCollection(name string) Option { return func(c *config) { c.collection = name } }
 
-// WithRetention auto-deletes done/dead tasks d after they finish, via a TTL
-// index on expires_at. 0 (default) keeps finished tasks forever. Task types
-// listed in WithRetentionByType override this default.
-func WithRetention(d time.Duration) Option { return func(c *config) { c.retention = d } }
-
-// WithRetentionByType gives specific task types their own retention,
-// overriding WithRetention. A 0 value keeps that type's finished tasks
-// forever even when a default retention is set.
-func WithRetentionByType(byType map[string]time.Duration) Option {
-	return func(c *config) { c.retentionByType = byType }
-}
-
 // WithEnqueueChunkSize sets how many tasks a single batch-enqueue insert
 // carries (default 1000). Bigger batches are written chunk by chunk, so a
 // 100k fan-out neither builds one giant wire message nor fails opaquely.
@@ -65,12 +51,10 @@ func WithPing(ping bool) Option { return func(c *config) { c.ping = ping } }
 
 // Store is the MongoDB-backed gotasks.Store.
 type Store struct {
-	client          *mongo.Client
-	col             *mongo.Collection
-	retention       time.Duration
-	retentionByType map[string]time.Duration
-	enqueueChunk    int
-	ownsClient      bool
+	client       *mongo.Client
+	col          *mongo.Collection
+	enqueueChunk int
+	ownsClient   bool
 }
 
 var _ gotasks.Store = (*Store)(nil)
@@ -116,11 +100,9 @@ func build(ctx context.Context, client *mongo.Client, cfg config) (*Store, error
 		return nil, fmt.Errorf("mongostore: enqueue chunk size must be 1..10000, got %d", cfg.enqueueChunk)
 	}
 	s := &Store{
-		client:          client,
-		col:             client.Database(cfg.database).Collection(cfg.collection),
-		retention:       cfg.retention,
-		retentionByType: cfg.retentionByType,
-		enqueueChunk:    cfg.enqueueChunk,
+		client:       client,
+		col:          client.Database(cfg.database).Collection(cfg.collection),
+		enqueueChunk: cfg.enqueueChunk,
 	}
 	if err := s.ensureIndexes(ctx); err != nil {
 		return nil, fmt.Errorf("mongostore: ensure indexes: %w", err)
@@ -140,10 +122,10 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 			Options: options.Index().SetName("queue_claim"),
 		},
 		// Claim stale-reclaim branch + reaper sweep.
-		{Keys: bson.D{{Key: "status", Value: 1}, {Key: "locked_until", Value: 1}}},
-		// TTL retention: docs are deleted once expires_at passes. Sparse:
-		// only finished tasks carry the field, so the index stays tiny
-		// (cache-resident) and pending inserts don't pay a write into it.
+		{Keys: bson.D{{Key: "status", Value: 1}, {Key: "leased_until", Value: 1}}},
+		// Total-lifetime TTL: expires_at is stamped at CREATION (when a TTL
+		// applies) and Mongo purges the doc when it passes, in any state.
+		// Sparse: no-TTL tasks carry no field and pay no index write.
 		// Named explicitly so it never conflicts with a pre-v0.4 non-sparse
 		// "expires_at_1" (drop that one manually after upgrading).
 		{
@@ -166,15 +148,6 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 	return err
 }
 
-// retentionFor returns the retention for a task type (per-type override,
-// else the default). <= 0 means keep forever.
-func (s *Store) retentionFor(taskType string) time.Duration {
-	if d, ok := s.retentionByType[taskType]; ok {
-		return d
-	}
-	return s.retention
-}
-
 type taskDoc struct {
 	ID          primitive.ObjectID  `bson:"_id,omitempty"`
 	Queue       string              `bson:"queue"`
@@ -185,8 +158,8 @@ type taskDoc struct {
 	Attempts    int                 `bson:"attempts"`
 	MaxAttempts int                 `bson:"max_attempts"`
 	RunAt       time.Time           `bson:"run_at"`
-	LockedBy    string              `bson:"locked_by,omitempty"`
-	LockedUntil time.Time           `bson:"locked_until,omitempty"`
+	LeasedBy    string              `bson:"leased_by,omitempty"`
+	LeasedUntil time.Time           `bson:"leased_until,omitempty"`
 	LeaseToken  string              `bson:"lease_token,omitempty"`
 	Errors      []gotasks.TaskError `bson:"errors,omitempty"`
 	Result      bson.Raw            `bson:"result,omitempty"`
@@ -243,8 +216,9 @@ func (d *taskDoc) toTask() (*gotasks.Task, error) {
 		Attempts:    d.Attempts,
 		MaxAttempts: d.MaxAttempts,
 		RunAt:       d.RunAt,
-		LockedBy:    d.LockedBy,
-		LockedUntil: d.LockedUntil,
+		ExpiresAt:   d.ExpiresAt,
+		LeasedBy:    d.LeasedBy,
+		LeasedUntil: d.LeasedUntil,
 		LeaseToken:  d.LeaseToken,
 		Errors:      d.Errors,
 		Result:      result,
@@ -277,15 +251,11 @@ func (s *Store) Enqueue(ctx context.Context, tasks []*gotasks.Task) ([]string, e
 		if err != nil {
 			return nil, err
 		}
-		queue := t.Queue
-		if queue == "" {
-			queue = gotasks.DefaultQueue
-		}
 		id := primitive.NewObjectID()
 		ids[i] = id.Hex()
 		docs[i] = taskDoc{
 			ID:          id,
-			Queue:       queue,
+			Queue:       t.Queue,
 			Type:        t.Type,
 			UniqueKey:   t.UniqueKey,
 			Payload:     payload,
@@ -293,6 +263,7 @@ func (s *Store) Enqueue(ctx context.Context, tasks []*gotasks.Task) ([]string, e
 			Attempts:    t.Attempts,
 			MaxAttempts: t.MaxAttempts,
 			RunAt:       t.RunAt.UTC(),
+			ExpiresAt:   t.ExpiresAt,
 			CreatedAt:   t.CreatedAt.UTC(),
 			UpdatedAt:   t.UpdatedAt.UTC(),
 		}
@@ -371,7 +342,7 @@ func runnableFilter(now time.Time, types, queues []string) bson.M {
 		bson.M{"status": string(gotasks.StatusPending), "run_at": bson.M{"$lte": now}},
 		bson.M{
 			"status":       string(gotasks.StatusRunning),
-			"locked_until": bson.M{"$lt": now},
+			"leased_until": bson.M{"$lt": now},
 			"$expr":        bson.M{"$lt": bson.A{"$attempts", "$max_attempts"}},
 		},
 	}}
@@ -388,9 +359,9 @@ func claimUpdate(now time.Time, workerID, leaseToken string, lease time.Duration
 	return bson.M{
 		"$set": bson.M{
 			"status":       string(gotasks.StatusRunning),
-			"locked_by":    workerID,
+			"leased_by":    workerID,
 			"lease_token":  leaseToken,
-			"locked_until": now.Add(lease),
+			"leased_until": now.Add(lease),
 			"updated_at":   now,
 		},
 		"$inc": bson.M{"attempts": 1},
@@ -487,7 +458,7 @@ func (s *Store) ClaimBatch(ctx context.Context, claim gotasks.ClaimOptions, k in
 }
 
 // leaseFilter fences finalizing writes: only the current lease token may
-// touch a running task. Deliberately no locked_until check — finishing after
+// touch a running task. Deliberately no leased_until check — finishing after
 // expiry but before reclaim is a success (reclaim rotates the token anyway).
 func leaseFilter(id primitive.ObjectID, leaseToken string) bson.M {
 	return bson.M{
@@ -512,12 +483,9 @@ func (s *Store) completeWrite(t *gotasks.Task, result json.RawMessage, now time.
 	} else if raw != nil {
 		set["result"] = raw
 	}
-	if d := s.retentionFor(t.Type); d > 0 {
-		set["expires_at"] = now.Add(d)
-	}
 	update := bson.M{
 		"$set":   set,
-		"$unset": bson.M{"locked_by": "", "lease_token": "", "unique_key": ""},
+		"$unset": bson.M{"leased_by": "", "lease_token": "", "unique_key": ""},
 	}
 	return leaseFilter(o, t.LeaseToken), update, nil
 }
@@ -544,13 +512,10 @@ func (s *Store) failWrite(t *gotasks.Task, taskErr gotasks.TaskError, retryAt ti
 		return nil, nil, err
 	}
 	set := bson.M{"updated_at": now}
-	unset := bson.M{"locked_by": "", "lease_token": ""}
+	unset := bson.M{"leased_by": "", "lease_token": ""}
 	if terminal {
 		set["status"] = string(gotasks.StatusDead)
 		unset["unique_key"] = "" // dead releases the unique key
-		if d := s.retentionFor(t.Type); d > 0 {
-			set["expires_at"] = now.Add(d)
-		}
 	} else {
 		// Still active (will retry): the unique key stays held.
 		set["status"] = string(gotasks.StatusPending)
@@ -616,7 +581,7 @@ func (s *Store) ExtendLease(ctx context.Context, t *gotasks.Task, lease time.Dur
 	now := time.Now().UTC()
 	until := now.Add(lease)
 	res, err := s.col.UpdateOne(ctx, leaseFilter(o, t.LeaseToken),
-		bson.M{"$set": bson.M{"locked_until": until, "updated_at": now}})
+		bson.M{"$set": bson.M{"leased_until": until, "updated_at": now}})
 	if err != nil {
 		return time.Time{}, fmt.Errorf("mongostore: extend lease: %w", err)
 	}
@@ -627,13 +592,14 @@ func (s *Store) ExtendLease(ctx context.Context, t *gotasks.Task, lease time.Dur
 }
 
 // requeueUpdate resets a dead task to a freshly-enqueued state: pending,
-// attempts 0, runnable now, no retention expiry or stale result. Errors are
-// kept as history. The unique key was released when the task died and is NOT
-// restored (a new task may legitimately hold it by now).
+// attempts 0, runnable now, stale result cleared. Errors are kept as
+// history, the unique key is NOT restored (a new task may hold it by now),
+// and expires_at is UNTOUCHED: it is the task's total lifetime, stamped at
+// creation — a revived task keeps its original purge deadline.
 func requeueUpdate(now time.Time) bson.M {
 	return bson.M{
 		"$set":   bson.M{"status": string(gotasks.StatusPending), "attempts": 0, "run_at": now, "updated_at": now},
-		"$unset": bson.M{"expires_at": "", "result": "", "locked_by": "", "locked_until": "", "lease_token": ""},
+		"$unset": bson.M{"result": "", "leased_by": "", "leased_until": "", "lease_token": ""},
 	}
 }
 
@@ -666,38 +632,11 @@ func (s *Store) RequeueDead(ctx context.Context, taskType string) (int64, error)
 	return res.ModifiedCount, nil
 }
 
-// retentionExpr builds the expires_at value for the reaper's pipeline
-// update. With per-type retention it is a $switch on the task's own type
-// (0-retention types resolve to $$REMOVE = keep forever); with only a
-// default it is a plain date; with no retention at all it returns nil.
-func (s *Store) retentionExpr(now time.Time) any {
-	expiry := func(d time.Duration) any {
-		if d <= 0 {
-			return "$$REMOVE"
-		}
-		return now.Add(d)
-	}
-	if len(s.retentionByType) == 0 {
-		if s.retention <= 0 {
-			return nil
-		}
-		return now.Add(s.retention)
-	}
-	branches := bson.A{}
-	for taskType, d := range s.retentionByType {
-		branches = append(branches, bson.M{
-			"case": bson.M{"$eq": bson.A{"$type", taskType}},
-			"then": expiry(d),
-		})
-	}
-	return bson.M{"$switch": bson.M{"branches": branches, "default": expiry(s.retention)}}
-}
-
 func (s *Store) ReapExpired(ctx context.Context) (int64, error) {
 	now := time.Now().UTC()
 	filter := bson.M{
 		"status":       string(gotasks.StatusRunning),
-		"locked_until": bson.M{"$lt": now},
+		"leased_until": bson.M{"$lt": now},
 		"$expr":        bson.M{"$gte": bson.A{"$attempts", "$max_attempts"}},
 	}
 	set := bson.M{
@@ -708,19 +647,16 @@ func (s *Store) ReapExpired(ctx context.Context) (int64, error) {
 			bson.A{bson.M{
 				"at":      now,
 				"attempt": "$attempts",
-				"worker":  "$locked_by",
+				"worker":  "$leased_by",
 				"message": "lease expired before completion; attempts exhausted",
 			}},
 		}},
 	}
-	if expr := s.retentionExpr(now); expr != nil {
-		set["expires_at"] = expr
-	}
 	// Pipeline update so each reaped task's error entry records its own
-	// attempts/worker fields (and its own type's retention).
+	// attempts/worker fields.
 	res, err := s.col.UpdateMany(ctx, filter, mongo.Pipeline{
 		{{Key: "$set", Value: set}},
-		{{Key: "$unset", Value: bson.A{"locked_by", "lease_token", "unique_key"}}},
+		{{Key: "$unset", Value: bson.A{"leased_by", "lease_token", "unique_key"}}},
 	})
 	if err != nil {
 		return 0, fmt.Errorf("mongostore: reap: %w", err)

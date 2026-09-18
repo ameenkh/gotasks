@@ -65,9 +65,6 @@ func (s *fakeStore) Enqueue(_ context.Context, tasks []*Task) ([]string, error) 
 		}
 		s.seq++
 		c := cloneTask(t)
-		if c.Queue == "" {
-			c.Queue = DefaultQueue
-		}
 		c.ID = fmt.Sprintf("task-%d", s.seq)
 		s.tasks[c.ID] = c
 		ids[i] = c.ID
@@ -88,7 +85,7 @@ func (s *fakeStore) claimOneLocked(opts ClaimOptions, now time.Time) *Task {
 			continue
 		}
 		runnable := (t.Status == StatusPending && !t.RunAt.After(now)) ||
-			(t.Status == StatusRunning && t.LockedUntil.Before(now) && t.Attempts < t.MaxAttempts)
+			(t.Status == StatusRunning && t.LeasedUntil.Before(now) && t.Attempts < t.MaxAttempts)
 		if !runnable {
 			continue
 		}
@@ -102,9 +99,9 @@ func (s *fakeStore) claimOneLocked(opts ClaimOptions, now time.Time) *Task {
 	s.seq++
 	best.Status = StatusRunning
 	best.Attempts++
-	best.LockedBy = opts.WorkerID
+	best.LeasedBy = opts.WorkerID
 	best.LeaseToken = fmt.Sprintf("lease-%d", s.seq)
-	best.LockedUntil = now.Add(opts.Lease)
+	best.LeasedUntil = now.Add(opts.Lease)
 	best.UpdatedAt = now
 	return cloneTask(best)
 }
@@ -154,7 +151,7 @@ func (s *fakeStore) Complete(_ context.Context, task *Task, result json.RawMessa
 	}
 	t.Status = StatusDone
 	t.Result = slices.Clone(result)
-	t.LockedBy, t.LeaseToken, t.UniqueKey = "", "", ""
+	t.LeasedBy, t.LeaseToken, t.UniqueKey = "", "", ""
 	t.UpdatedAt = time.Now().UTC()
 	return nil
 }
@@ -174,7 +171,7 @@ func (s *fakeStore) Fail(_ context.Context, task *Task, taskErr TaskError, retry
 		t.Status = StatusPending
 		t.RunAt = retryAt
 	}
-	t.LockedBy, t.LeaseToken = "", ""
+	t.LeasedBy, t.LeaseToken = "", ""
 	t.UpdatedAt = time.Now().UTC()
 	return nil
 }
@@ -207,8 +204,8 @@ func (s *fakeStore) ExtendLease(_ context.Context, task *Task, lease time.Durati
 	if t == nil {
 		return time.Time{}, ErrLeaseLost
 	}
-	t.LockedUntil = time.Now().UTC().Add(lease)
-	return t.LockedUntil, nil
+	t.LeasedUntil = time.Now().UTC().Add(lease)
+	return t.LeasedUntil, nil
 }
 
 func (s *fakeStore) requeue(t *Task, now time.Time) {
@@ -216,7 +213,7 @@ func (s *fakeStore) requeue(t *Task, now time.Time) {
 	t.Attempts = 0
 	t.RunAt = now
 	t.Result = nil
-	t.LockedBy, t.LeaseToken = "", ""
+	t.LeasedBy, t.LeaseToken = "", ""
 	t.UpdatedAt = now
 }
 
@@ -251,13 +248,13 @@ func (s *fakeStore) ReapExpired(_ context.Context) (int64, error) {
 	now := time.Now().UTC()
 	var n int64
 	for _, t := range s.tasks {
-		if t.Status == StatusRunning && t.LockedUntil.Before(now) && t.Attempts >= t.MaxAttempts {
+		if t.Status == StatusRunning && t.LeasedUntil.Before(now) && t.Attempts >= t.MaxAttempts {
 			t.Status = StatusDead
 			t.Errors = append(t.Errors, TaskError{
-				At: now, Attempt: t.Attempts, Worker: t.LockedBy,
+				At: now, Attempt: t.Attempts, Worker: t.LeasedBy,
 				Message: "lease expired before completion; attempts exhausted",
 			})
-			t.LockedBy, t.LeaseToken, t.UniqueKey = "", "", ""
+			t.LeasedBy, t.LeaseToken, t.UniqueKey = "", "", ""
 			n++
 		}
 	}

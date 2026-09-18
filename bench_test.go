@@ -48,14 +48,14 @@ func benchStore(b *testing.B) *mongostore.Store {
 
 func BenchmarkEnqueueSingle(b *testing.B) {
 	st := benchStore(b)
-	m, err := gotasks.New(st)
+	m, err := gotasks.New(st, gotasks.WithQueues(gotasks.QueuePolicy{Name: "bench"}))
 	if err != nil {
 		b.Fatal(err)
 	}
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := gotasks.Enqueue(ctx, m, "bench", struct{ N int }{N: i}); err != nil {
+		if _, err := gotasks.Enqueue(ctx, m, "bench", "bench", struct{ N int }{N: i}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -63,7 +63,7 @@ func BenchmarkEnqueueSingle(b *testing.B) {
 
 func BenchmarkEnqueueMany100(b *testing.B) {
 	st := benchStore(b)
-	m, err := gotasks.New(st)
+	m, err := gotasks.New(st, gotasks.WithQueues(gotasks.QueuePolicy{Name: "bench"}))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func BenchmarkEnqueueMany100(b *testing.B) {
 	batch := make([]struct{ N int }, 100)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := gotasks.EnqueueMany(ctx, m, "bench", batch); err != nil {
+		if _, err := gotasks.EnqueueMany(ctx, m, "bench", "bench", batch); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -81,6 +81,7 @@ func BenchmarkEnqueueMany100(b *testing.B) {
 func benchThroughput(b *testing.B, opts ...gotasks.Option) {
 	st := benchStore(b)
 	m, err := gotasks.New(st, append([]gotasks.Option{
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "bench"}),
 		gotasks.WithPollInterval(50 * time.Millisecond),
 		gotasks.WithReapInterval(0),
 		gotasks.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
@@ -103,7 +104,7 @@ func benchThroughput(b *testing.B, opts ...gotasks.Option) {
 	payloads := make([]struct{ N int }, chunk)
 	for enqueued := 0; enqueued < b.N; enqueued += chunk {
 		n := min(chunk, b.N-enqueued)
-		if _, err := gotasks.EnqueueMany(ctx, m, "bench", payloads[:n]); err != nil {
+		if _, err := gotasks.EnqueueMany(ctx, m, "bench", "bench", payloads[:n]); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -150,7 +151,7 @@ func BenchmarkThroughputPipeline64x16Workers(b *testing.B) {
 
 func BenchmarkEnqueueMany10k(b *testing.B) {
 	st := benchStore(b)
-	m, err := gotasks.New(st)
+	m, err := gotasks.New(st, gotasks.WithQueues(gotasks.QueuePolicy{Name: "bench"}))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -158,7 +159,7 @@ func BenchmarkEnqueueMany10k(b *testing.B) {
 	batch := make([]struct{ N int }, 10000)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := gotasks.EnqueueMany(ctx, m, "bench", batch); err != nil {
+		if _, err := gotasks.EnqueueMany(ctx, m, "bench", "bench", batch); err != nil {
 			b.Fatal(err)
 		}
 	}

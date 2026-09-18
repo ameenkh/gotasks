@@ -25,13 +25,15 @@ func main() {
 
 	store, err := mongostore.New(ctx, "mongodb://localhost:27017",
 		mongostore.WithDatabase("gotasks_example"),
-		mongostore.WithRetention(24*time.Hour), // finished tasks auto-prune after a day
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	m, err := gotasks.New(store,
+		// Every queue is declared explicitly; TTL is the tasks' total
+		// lifetime (purged 24h after creation, done or not).
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "emails", TTL: 24 * time.Hour}),
 		gotasks.WithWorkers(4),
 		gotasks.WithPollInterval(2*time.Second),
 		gotasks.WithLeaseTime(time.Minute),
@@ -54,18 +56,18 @@ func main() {
 	}
 
 	// Immediate, batch, and scheduled enqueues.
-	if _, err := gotasks.Enqueue(ctx, m, "email", EmailPayload{To: "a@example.com", Subject: "hello"}); err != nil {
+	if _, err := gotasks.Enqueue(ctx, m, "emails", "email", EmailPayload{To: "a@example.com", Subject: "hello"}); err != nil {
 		log.Fatal(err)
 	}
-	if _, err := gotasks.EnqueueMany(ctx, m, "email", []EmailPayload{
+	if _, err := gotasks.EnqueueMany(ctx, m, "emails", "email", []EmailPayload{
 		{To: "b@example.com", Subject: "batch 1"},
 		{To: "c@example.com", Subject: "batch 2"},
 	}); err != nil {
 		log.Fatal(err)
 	}
-	if _, err := gotasks.Enqueue(ctx, m, "email",
+	if _, err := gotasks.Enqueue(ctx, m, "emails", "email",
 		EmailPayload{To: "d@example.com", Subject: "10s later"},
-		gotasks.WithDelay(10*time.Second),
+		gotasks.TaskPolicy{Delay: 10 * time.Second},
 	); err != nil {
 		log.Fatal(err)
 	}

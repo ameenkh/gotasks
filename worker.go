@@ -94,13 +94,13 @@ func (m *Manager) process(workerID string, t *Task) {
 // shouldBufferOutcome applies the batch-finalize safety gate: buffer only
 // when batching is on, the task is not at-most-once (its semantics must
 // never wait in a buffer), and the lease comfortably outlives the buffer
-// window. t.LockedUntil may be stale-early if the heartbeat extended the
+// window. t.LeasedUntil may be stale-early if the heartbeat extended the
 // lease meanwhile — that errs toward the immediate path, which is safe.
 func (m *Manager) shouldBufferOutcome(t *Task) bool {
 	if !m.finalizeOn() || t.MaxAttempts == 1 {
 		return false
 	}
-	return time.Until(t.LockedUntil) >= m.finMargin
+	return time.Until(t.LeasedUntil) >= m.finMargin
 }
 
 // finalizeNow writes one outcome immediately (the only path when batching
@@ -131,9 +131,9 @@ func (m *Manager) bufferOutcome(o Outcome) {
 	m.finMu.Lock()
 	if len(m.finBuf) == 0 {
 		m.finOldest = time.Now()
-		m.finMinLease = o.Task.LockedUntil
-	} else if o.Task.LockedUntil.Before(m.finMinLease) {
-		m.finMinLease = o.Task.LockedUntil
+		m.finMinLease = o.Task.LeasedUntil
+	} else if o.Task.LeasedUntil.Before(m.finMinLease) {
+		m.finMinLease = o.Task.LeasedUntil
 	}
 	m.finBuf = append(m.finBuf, o)
 	m.finMu.Unlock()

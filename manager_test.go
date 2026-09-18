@@ -12,6 +12,7 @@ import (
 func testManager(t *testing.T, store Store, opts ...Option) *Manager {
 	t.Helper()
 	base := []Option{
+		WithQueues(QueuePolicy{Name: "default"}),
 		WithWorkers(2),
 		WithPollInterval(5 * time.Millisecond),
 		WithLeaseTime(time.Second),
@@ -69,7 +70,7 @@ func TestEnqueueAndComplete(t *testing.T) {
 		t.Fatalf("RegisterHandler: %v", err)
 	}
 
-	id, err := Enqueue(context.Background(), m, "email", emailPayload{To: "a@b.c", Subject: "hi"})
+	id, err := Enqueue(context.Background(), m, "default", "email", emailPayload{To: "a@b.c", Subject: "hi"})
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -97,7 +98,7 @@ func TestRetryThenTerminalFailure(t *testing.T) {
 		return nil, errors.New("boom")
 	})
 
-	id, err := Enqueue(context.Background(), m, "flaky", struct{}{}, WithMaxAttempts(2))
+	id, err := Enqueue(context.Background(), m, "default", "flaky", struct{}{}, TaskPolicy{MaxAttempts: 2})
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -130,7 +131,7 @@ func TestRetrySucceedsSecondAttempt(t *testing.T) {
 		return nil, nil
 	})
 
-	id, _ := Enqueue(context.Background(), m, "flaky", struct{}{}, WithMaxAttempts(3))
+	id, _ := Enqueue(context.Background(), m, "default", "flaky", struct{}{}, TaskPolicy{MaxAttempts: 3})
 	startManager(t, m)
 
 	task := waitForStatus(t, fs, id, StatusDone)
@@ -147,7 +148,7 @@ func TestPanicIsAFailedAttempt(t *testing.T) {
 		panic("kaboom")
 	})
 
-	id, _ := Enqueue(context.Background(), m, "panicky", struct{}{}, WithMaxAttempts(1))
+	id, _ := Enqueue(context.Background(), m, "default", "panicky", struct{}{}, TaskPolicy{MaxAttempts: 1})
 	startManager(t, m)
 
 	task := waitForStatus(t, fs, id, StatusDead)
@@ -165,7 +166,7 @@ func TestHandlerTimeout(t *testing.T) {
 		return nil, ctx.Err()
 	}, WithHandlerTimeout(30*time.Millisecond))
 
-	id, _ := Enqueue(context.Background(), m, "slow", struct{}{}, WithMaxAttempts(1))
+	id, _ := Enqueue(context.Background(), m, "default", "slow", struct{}{}, TaskPolicy{MaxAttempts: 1})
 	startManager(t, m)
 
 	task := waitForStatus(t, fs, id, StatusDead)
@@ -182,7 +183,7 @@ func TestScheduledTaskWaitsForRunAt(t *testing.T) {
 		return nil, nil
 	})
 
-	id, _ := Enqueue(context.Background(), m, "later", struct{}{}, WithDelay(150*time.Millisecond))
+	id, _ := Enqueue(context.Background(), m, "default", "later", struct{}{}, TaskPolicy{Delay: 150 * time.Millisecond})
 	startManager(t, m)
 
 	time.Sleep(75 * time.Millisecond)
@@ -197,7 +198,7 @@ func TestStaleTaskReclaimedThenCompletes(t *testing.T) {
 	// First claim it directly (simulating a dead worker) with a tiny lease.
 	ctx := context.Background()
 	ids, err := fs.Enqueue(ctx, []*Task{{
-		Type: "job", Status: StatusPending, MaxAttempts: 3,
+		Queue: "default", Type: "job", Status: StatusPending, MaxAttempts: 3,
 		RunAt: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}})
 	if err != nil {
@@ -229,7 +230,7 @@ func TestAtMostOnceStaleIsReapedNotRetried(t *testing.T) {
 	fs := newFakeStore()
 	ctx := context.Background()
 	ids, _ := fs.Enqueue(ctx, []*Task{{
-		Type: "once", Status: StatusPending, MaxAttempts: 1,
+		Queue: "default", Type: "once", Status: StatusPending, MaxAttempts: 1,
 		RunAt: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}})
 	if _, err := fs.Claim(ctx, ClaimOptions{WorkerID: "dead-worker", Lease: time.Millisecond}); err != nil {
@@ -265,12 +266,12 @@ func TestEnqueueManyAndTypeRestriction(t *testing.T) {
 	})
 
 	payloads := []map[string]int{{"n": 1}, {"n": 2}, {"n": 3}}
-	ids, err := EnqueueMany(context.Background(), m, "bulk", payloads)
+	ids, err := EnqueueMany(context.Background(), m, "default", "bulk", payloads)
 	if err != nil || len(ids) != 3 {
 		t.Fatalf("EnqueueMany: ids=%v err=%v", ids, err)
 	}
 	// A task type with no registered handler must never be claimed.
-	otherID, _ := Enqueue(context.Background(), m, "other-service-type", struct{}{})
+	otherID, _ := Enqueue(context.Background(), m, "default", "other-service-type", struct{}{})
 	startManager(t, m)
 
 	for _, id := range ids {
@@ -284,10 +285,10 @@ func TestEnqueueManyAndTypeRestriction(t *testing.T) {
 
 func TestPayloadMustBeObject(t *testing.T) {
 	m := testManager(t, newFakeStore())
-	if _, err := Enqueue(context.Background(), m, "t", "just a string"); err == nil {
+	if _, err := Enqueue(context.Background(), m, "default", "t", "just a string"); err == nil {
 		t.Fatal("expected error for non-object payload")
 	}
-	if _, err := Enqueue(context.Background(), m, "t", 42); err == nil {
+	if _, err := Enqueue(context.Background(), m, "default", "t", 42); err == nil {
 		t.Fatal("expected error for numeric payload")
 	}
 }
@@ -313,7 +314,7 @@ func TestStopDrainsInFlight(t *testing.T) {
 		return nil, nil
 	})
 
-	id, _ := Enqueue(context.Background(), m, "slow", struct{}{})
+	id, _ := Enqueue(context.Background(), m, "default", "slow", struct{}{})
 	if err := m.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -362,7 +363,7 @@ func TestHeartbeatKeepsLongHandlerAlive(t *testing.T) {
 		return nil, nil
 	})
 
-	id, _ := Enqueue(context.Background(), m, "long", struct{}{}, WithMaxAttempts(3))
+	id, _ := Enqueue(context.Background(), m, "default", "long", struct{}{}, TaskPolicy{MaxAttempts: 3})
 	startManager(t, m)
 
 	task := waitForStatus(t, fs, id, StatusDone)
@@ -388,7 +389,7 @@ func TestNoHeartbeatByDefaultLongHandlerIsReclaimed(t *testing.T) {
 		return nil, nil
 	})
 
-	id, _ := Enqueue(context.Background(), m, "long", struct{}{}, WithMaxAttempts(3))
+	id, _ := Enqueue(context.Background(), m, "default", "long", struct{}{}, TaskPolicy{MaxAttempts: 3})
 	startManager(t, m)
 
 	task := waitForStatus(t, fs, id, StatusDone) // second worker reclaims and finishes
@@ -416,7 +417,7 @@ func TestHeartbeatLeaseLossCancelsHandler(t *testing.T) {
 		}
 	})
 
-	_, _ = Enqueue(context.Background(), m, "doomed", struct{}{}, WithMaxAttempts(1))
+	_, _ = Enqueue(context.Background(), m, "default", "doomed", struct{}{}, TaskPolicy{MaxAttempts: 1})
 	startManager(t, m)
 
 	select {
@@ -439,7 +440,7 @@ func TestDeadTaskRequeueRunsAgain(t *testing.T) {
 		return nil, nil
 	})
 
-	id, _ := Enqueue(context.Background(), m, "flaky", struct{}{}, WithMaxAttempts(2))
+	id, _ := Enqueue(context.Background(), m, "default", "flaky", struct{}{}, TaskPolicy{MaxAttempts: 2})
 	startManager(t, m)
 
 	waitForStatus(t, fs, id, StatusDead)
@@ -465,7 +466,7 @@ func TestRequeueDeadByType(t *testing.T) {
 	now := time.Now().UTC()
 	mk := func(taskType string) string {
 		ids, _ := fs.Enqueue(ctx, []*Task{{
-			Type: taskType, Status: StatusDead, MaxAttempts: 1, Attempts: 1,
+			Queue: "default", Type: taskType, Status: StatusDead, MaxAttempts: 1, Attempts: 1,
 			RunAt: now, CreatedAt: now, UpdatedAt: now,
 		}})
 		return ids[0]
@@ -497,12 +498,12 @@ func TestUniqueKeyDedup(t *testing.T) {
 		return nil, nil
 	})
 
-	id1, err := Enqueue(ctx, m, "sync", struct{}{}, WithUniqueKey("tenant-42"))
+	id1, err := Enqueue(ctx, m, "default", "sync", struct{}{}, TaskPolicy{UniqueKey: "tenant-42"})
 	if err != nil {
 		t.Fatalf("first enqueue: %v", err)
 	}
 	// Duplicate: must return the existing id + ErrDuplicateTask.
-	id2, err := Enqueue(ctx, m, "sync", struct{}{}, WithUniqueKey("tenant-42"))
+	id2, err := Enqueue(ctx, m, "default", "sync", struct{}{}, TaskPolicy{UniqueKey: "tenant-42"})
 	if !errors.Is(err, ErrDuplicateTask) {
 		t.Fatalf("duplicate enqueue: got %v, want ErrDuplicateTask", err)
 	}
@@ -510,7 +511,7 @@ func TestUniqueKeyDedup(t *testing.T) {
 		t.Errorf("duplicate returned id %q, want existing %q", id2, id1)
 	}
 	// A different key is fine.
-	if _, err := Enqueue(ctx, m, "sync", struct{}{}, WithUniqueKey("tenant-43")); err != nil {
+	if _, err := Enqueue(ctx, m, "default", "sync", struct{}{}, TaskPolicy{UniqueKey: "tenant-43"}); err != nil {
 		t.Fatalf("different key: %v", err)
 	}
 
@@ -518,7 +519,7 @@ func TestUniqueKeyDedup(t *testing.T) {
 	waitForStatus(t, fs, id1, StatusDone)
 
 	// Done released the key: same key enqueues fresh.
-	id3, err := Enqueue(ctx, m, "sync", struct{}{}, WithUniqueKey("tenant-42"))
+	id3, err := Enqueue(ctx, m, "default", "sync", struct{}{}, TaskPolicy{UniqueKey: "tenant-42"})
 	if err != nil {
 		t.Fatalf("re-enqueue after done: %v", err)
 	}
@@ -529,8 +530,8 @@ func TestUniqueKeyDedup(t *testing.T) {
 
 func TestUniqueKeyRejectedForBatch(t *testing.T) {
 	m := testManager(t, newFakeStore())
-	_, err := EnqueueMany(context.Background(), m, "t",
-		[]struct{}{{}, {}}, WithUniqueKey("k"))
+	_, err := EnqueueMany(context.Background(), m, "default", "t",
+		[]struct{}{{}, {}}, TaskPolicy{UniqueKey: "k"})
 	if err == nil {
 		t.Fatal("expected error for WithUniqueKey on a batch")
 	}
@@ -550,7 +551,7 @@ func TestBatchModeProcessesAllExactlyOnce(t *testing.T) {
 	for i := range payloads {
 		payloads[i].N = i
 	}
-	ids, err := EnqueueMany(context.Background(), m, "bulk", payloads)
+	ids, err := EnqueueMany(context.Background(), m, "default", "bulk", payloads)
 	if err != nil || len(ids) != 100 {
 		t.Fatalf("EnqueueMany: %d ids, %v", len(ids), err)
 	}
@@ -590,7 +591,7 @@ func TestBatchModeQueueLeaseAgingDropsThenReclaims(t *testing.T) {
 		return nil, nil
 	})
 
-	ids, err := EnqueueMany(context.Background(), m, "slow", make([]struct{}, 5))
+	ids, err := EnqueueMany(context.Background(), m, "default", "slow", make([]struct{}, 5))
 	if err != nil {
 		t.Fatalf("EnqueueMany: %v", err)
 	}
@@ -621,8 +622,8 @@ func TestBatchModeForeignTypesUntouched(t *testing.T) {
 		return nil, nil
 	})
 
-	ids, _ := EnqueueMany(context.Background(), m, "mine", make([]struct{}, 10))
-	otherID, _ := Enqueue(context.Background(), m, "other-service-type", struct{}{})
+	ids, _ := EnqueueMany(context.Background(), m, "default", "mine", make([]struct{}, 10))
+	otherID, _ := Enqueue(context.Background(), m, "default", "other-service-type", struct{}{})
 	startManager(t, m)
 
 	for _, id := range ids {
@@ -635,46 +636,58 @@ func TestBatchModeForeignTypesUntouched(t *testing.T) {
 }
 
 func TestPipelineValidation(t *testing.T) {
-	if _, err := New(newFakeStore(), WithPipelineMode(PipelineConfig{})); err != nil {
+	q := WithQueues(QueuePolicy{Name: "q"})
+	if _, err := New(newFakeStore(), q, WithPipelineMode(PipelineConfig{})); err != nil {
 		t.Errorf("zero-value PipelineConfig must be valid: %v", err)
 	}
-	if _, err := New(newFakeStore(), WithPipelineMode(PipelineConfig{ClaimBatch: 101})); err == nil {
+	if _, err := New(newFakeStore(), q, WithPipelineMode(PipelineConfig{ClaimBatch: 101})); err == nil {
 		t.Error("ClaimBatch 101 accepted")
 	}
-	if _, err := New(newFakeStore(), WithPipelineMode(PipelineConfig{QueueLease: -time.Second})); err == nil {
+	if _, err := New(newFakeStore(), q, WithPipelineMode(PipelineConfig{QueueLease: -time.Second})); err == nil {
 		t.Error("negative QueueLease accepted")
 	}
-	if _, err := New(newFakeStore(), WithPipelineMode(PipelineConfig{FinalizeBatch: 1001})); err == nil {
+	if _, err := New(newFakeStore(), q, WithPipelineMode(PipelineConfig{FinalizeBatch: 1001})); err == nil {
 		t.Error("FinalizeBatch 1001 accepted")
+	}
+	if _, err := New(newFakeStore()); err == nil {
+		t.Error("manager without any declared queue accepted")
+	}
+	if _, err := New(newFakeStore(), WithQueues(QueuePolicy{Name: "q"}), WithQueues(QueuePolicy{Name: "q"})); err == nil {
+		t.Error("duplicate queue declaration accepted")
 	}
 }
 
 func TestManagerServesOnlyItsQueues(t *testing.T) {
 	fs := newFakeStore()
-	m := testManager(t, fs, WithQueues("emails"))
+	emailMgr := testManager(t, fs, WithQueues(QueuePolicy{Name: "emails"}))
+	otherMgr := testManager(t, fs, WithQueues(QueuePolicy{Name: "reports"}))
 
 	var done atomic.Int32
-	_ = RegisterHandler(m, "send", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+	_ = RegisterHandler(emailMgr, "send", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
 		done.Add(1)
 		return nil, nil
 	})
 
 	ctx := context.Background()
-	emailID, _ := Enqueue(ctx, m, "send", struct{}{}, WithQueue("emails"))
-	reportID, _ := Enqueue(ctx, m, "send", struct{}{}, WithQueue("reports"))
-	defaultID, _ := Enqueue(ctx, m, "send", struct{}{}) // DefaultQueue
-	startManager(t, m)
+	// testManager prepends a "default" queue, so emailMgr serves default+emails.
+	emailID, err := Enqueue(ctx, emailMgr, "emails", "send", struct{}{})
+	if err != nil {
+		t.Fatalf("enqueue emails: %v", err)
+	}
+	// Enqueueing to a queue this manager did not declare is an error.
+	if _, err := Enqueue(ctx, emailMgr, "reports", "send", struct{}{}); err == nil {
+		t.Fatal("enqueue to undeclared queue must fail")
+	}
+	reportID, err := Enqueue(ctx, otherMgr, "reports", "send", struct{}{})
+	if err != nil {
+		t.Fatalf("enqueue reports: %v", err)
+	}
+	startManager(t, emailMgr) // only the email manager consumes
 
 	waitForStatus(t, fs, emailID, StatusDone)
 	time.Sleep(30 * time.Millisecond)
 	if task := fs.get(reportID); task.Status != StatusPending {
-		t.Errorf("reports-queue task claimed by emails manager: %+v", task)
-	}
-	if task := fs.get(defaultID); task.Status != StatusPending {
-		t.Errorf("default-queue task claimed by emails manager: %+v", task)
-	}
-	if task := fs.get(defaultID); task.Queue != DefaultQueue {
-		t.Errorf("queue not defaulted: %q", task.Queue)
+		t.Errorf("reports task consumed by non-subscribed manager: %+v", task)
 	}
 	if done.Load() != 1 {
 		t.Errorf("handled %d tasks, want 1", done.Load())
@@ -719,7 +732,7 @@ func TestChangeStreamNudgeWakesWorkers(t *testing.T) {
 			startManager(t, m)
 			time.Sleep(100 * time.Millisecond) // let workers reach their idle wait
 
-			id, _ := Enqueue(context.Background(), m, "job", struct{}{})
+			id, _ := Enqueue(context.Background(), m, "default", "job", struct{}{})
 			time.Sleep(150 * time.Millisecond)
 			if task := ws.get(id); task.Status == StatusDone {
 				t.Fatal("task ran without a nudge — polling should be idle for 10m")
@@ -740,7 +753,7 @@ func TestWithoutChangeStreamIgnoresWatcher(t *testing.T) {
 	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
 		return nil, nil
 	})
-	id, _ := Enqueue(context.Background(), m, "job", struct{}{})
+	id, _ := Enqueue(context.Background(), m, "default", "job", struct{}{})
 	startManager(t, m)
 	waitForStatus(t, ws.fakeStore, id, StatusDone) // polling picked it up; no nudge ever sent
 }
@@ -756,7 +769,7 @@ func TestFinalizeBatchFlushBySize(t *testing.T) {
 	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
 		return map[string]bool{"ok": true}, nil
 	})
-	ids, _ := EnqueueMany(context.Background(), m, "job", make([]struct{}, 3))
+	ids, _ := EnqueueMany(context.Background(), m, "default", "job", make([]struct{}, 3))
 	startManager(t, m)
 
 	for _, id := range ids {
@@ -779,7 +792,7 @@ func TestFinalizeBatchFlushByInterval(t *testing.T) {
 		close(ran)
 		return nil, nil
 	})
-	id, _ := Enqueue(context.Background(), m, "job", struct{}{})
+	id, _ := Enqueue(context.Background(), m, "default", "job", struct{}{})
 	startManager(t, m)
 
 	<-ran
@@ -801,7 +814,7 @@ func TestFinalizeBatchAtMostOnceBypasses(t *testing.T) {
 	_ = RegisterHandler(m, "once", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
 		return nil, nil
 	})
-	id, _ := Enqueue(context.Background(), m, "once", struct{}{}, WithMaxAttempts(1))
+	id, _ := Enqueue(context.Background(), m, "default", "once", struct{}{}, TaskPolicy{MaxAttempts: 1})
 	startManager(t, m)
 	waitForStatus(t, fs, id, StatusDone) // immediate path, no buffering
 }
@@ -816,7 +829,7 @@ func TestFinalizeBatchLeaseMarginBypasses(t *testing.T) {
 	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
 		return nil, nil
 	})
-	id, _ := Enqueue(context.Background(), m, "job", struct{}{})
+	id, _ := Enqueue(context.Background(), m, "default", "job", struct{}{})
 	startManager(t, m)
 	waitForStatus(t, fs, id, StatusDone)
 }
@@ -833,7 +846,7 @@ func TestFinalizeBatchDrainsOnStop(t *testing.T) {
 		ran.Add(1)
 		return nil, nil
 	})
-	ids, _ := EnqueueMany(context.Background(), m, "job", make([]struct{}, 4))
+	ids, _ := EnqueueMany(context.Background(), m, "default", "job", make([]struct{}, 4))
 	if err := m.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -864,7 +877,7 @@ func TestFinalizeBatchFailuresRetryAndDie(t *testing.T) {
 		calls.Add(1)
 		return nil, errors.New("boom")
 	})
-	id, _ := Enqueue(context.Background(), m, "flaky", struct{}{}, WithMaxAttempts(2))
+	id, _ := Enqueue(context.Background(), m, "default", "flaky", struct{}{}, TaskPolicy{MaxAttempts: 2})
 	startManager(t, m)
 
 	task := waitForStatus(t, fs, id, StatusDead)
@@ -873,5 +886,74 @@ func TestFinalizeBatchFailuresRetryAndDie(t *testing.T) {
 	}
 	if calls.Load() != 2 {
 		t.Errorf("handler calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestLifetimeTTLStamping(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs,
+		WithQueues(QueuePolicy{Name: "mail", TTL: time.Hour}),
+		WithQueues(QueuePolicy{Name: "audit"})) // TTL 0 = no expiry
+	ctx := context.Background()
+	before := time.Now()
+
+	check := func(id string, want time.Duration) {
+		t.Helper()
+		task := fs.get(id)
+		if want == 0 {
+			if task.ExpiresAt != nil {
+				t.Errorf("task %s: expires_at = %v, want none", id, task.ExpiresAt)
+			}
+			return
+		}
+		if task.ExpiresAt == nil {
+			t.Fatalf("task %s: expires_at missing, want ~%s", id, want)
+		}
+		d := task.ExpiresAt.Sub(before)
+		if d < want-time.Minute || d > want+time.Minute {
+			t.Errorf("task %s: lifetime = %s, want ~%s", id, d, want)
+		}
+	}
+
+	id1, _ := Enqueue(ctx, m, "mail", "t", struct{}{})                                        // queue TTL from now
+	id2, _ := Enqueue(ctx, m, "mail", "t", struct{}{}, TaskPolicy{Delay: 2 * time.Hour})       // TTL measured from run_at
+	id3, _ := Enqueue(ctx, m, "audit", "t", struct{}{})                                       // queue has no TTL
+	check(id1, time.Hour)
+	check(id2, 3*time.Hour) // 2h schedule delay + 1h queue TTL
+	check(id3, 0)
+}
+
+func TestQueuePolicyMaxAttemptsInheritance(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs,
+		WithQueues(QueuePolicy{Name: "risky", MaxAttempts: 7}),
+		WithDefaultMaxAttempts(3))
+	ctx := context.Background()
+
+	id1, _ := Enqueue(ctx, m, "risky", "t", struct{}{})                            // queue default
+	id2, _ := Enqueue(ctx, m, "risky", "t", struct{}{}, TaskPolicy{MaxAttempts: 1}) // task override
+	id3, _ := Enqueue(ctx, m, "default", "t", struct{}{})                          // manager default
+	if got := fs.get(id1).MaxAttempts; got != 7 {
+		t.Errorf("queue-level max attempts = %d, want 7", got)
+	}
+	if got := fs.get(id2).MaxAttempts; got != 1 {
+		t.Errorf("task-level max attempts = %d, want 1", got)
+	}
+	if got := fs.get(id3).MaxAttempts; got != 3 {
+		t.Errorf("manager-default max attempts = %d, want 3", got)
+	}
+}
+
+func TestEnqueueAddressingValidation(t *testing.T) {
+	m := testManager(t, newFakeStore())
+	ctx := context.Background()
+	if _, err := Enqueue(ctx, m, "nope", "t", struct{}{}); err == nil {
+		t.Error("undeclared queue accepted")
+	}
+	if _, err := Enqueue(ctx, m, "default", "", struct{}{}); err == nil {
+		t.Error("empty task type accepted")
+	}
+	if _, err := Enqueue(ctx, m, "default", "t", struct{}{}, TaskPolicy{}, TaskPolicy{}); err == nil {
+		t.Error("two TaskPolicy values accepted")
 	}
 }

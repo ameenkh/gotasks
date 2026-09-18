@@ -32,6 +32,7 @@ func main() {
 	}
 
 	m, err := gotasks.New(store,
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "syncs"}),
 		gotasks.WithWorkers(2),
 		gotasks.WithPollInterval(100*time.Millisecond),
 	)
@@ -53,9 +54,9 @@ func main() {
 	}
 
 	enqueue := func() {
-		id, err := gotasks.Enqueue(ctx, m, "tenant-sync",
+		id, err := gotasks.Enqueue(ctx, m, "syncs", "tenant-sync",
 			SyncJob{Tenant: "tenant-42"},
-			gotasks.WithUniqueKey("sync:tenant-42"))
+			gotasks.TaskPolicy{UniqueKey: "sync:tenant-42"})
 		switch {
 		case errors.Is(err, gotasks.ErrDuplicateTask):
 			fmt.Printf("enqueue deduped -> already active as task %s\n", id)

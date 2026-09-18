@@ -22,10 +22,12 @@ type handlerEntry struct {
 // handlers with RegisterHandler, then Start (or Run). Enqueue works from any
 // process, including ones that never start workers.
 type Manager struct {
-	store    Store
-	cfg      Config
-	handlers map[string]handlerEntry
-	types    []string // registered handler types; claims are restricted to these
+	store      Store
+	cfg        Config
+	handlers   map[string]handlerEntry
+	types      []string // registered handler types; claims are restricted to these
+	queueNames []string
+	queues     map[string]QueuePolicy
 
 	started     atomic.Bool
 	runCtx      context.Context    // cancelled only on hard stop; parent of handler contexts
@@ -53,7 +55,7 @@ type Manager struct {
 	finMu       sync.Mutex
 	finBuf      []Outcome
 	finOldest   time.Time // when the oldest buffered outcome entered
-	finMinLease time.Time // earliest LockedUntil among buffered outcomes
+	finMinLease time.Time // earliest LeasedUntil among buffered outcomes
 	finWake     chan struct{}
 	finMargin   time.Duration
 	workerWg    sync.WaitGroup
@@ -119,12 +121,25 @@ func New(store Store, opts ...Option) (*Manager, error) {
 		return nil, errors.New("gotasks: FallbackPoll must be > 0")
 	}
 	if len(cfg.Queues) == 0 {
-		cfg.Queues = []string{DefaultQueue}
+		return nil, errors.New("gotasks: at least one queue must be declared with WithQueues (there is no default queue)")
 	}
+	queues := make(map[string]QueuePolicy, len(cfg.Queues))
+	queueNames := make([]string, 0, len(cfg.Queues))
 	for _, q := range cfg.Queues {
-		if q == "" {
+		if q.Name == "" {
 			return nil, errors.New("gotasks: queue names must not be empty")
 		}
+		if q.TTL < 0 {
+			return nil, errors.New("gotasks: QueuePolicy.TTL must be >= 0 (0 = no expiry)")
+		}
+		if q.MaxAttempts < 0 {
+			return nil, errors.New("gotasks: QueuePolicy.MaxAttempts must be >= 0 (0 = inherit)")
+		}
+		if _, dup := queues[q.Name]; dup {
+			return nil, fmt.Errorf("gotasks: queue %q declared twice", q.Name)
+		}
+		queues[q.Name] = q
+		queueNames = append(queueNames, q.Name)
 	}
 	if p := cfg.Pipeline; p != nil {
 		// Resolve pipeline defaults in place; the rest of the manager reads
@@ -160,19 +175,23 @@ func New(store Store, opts ...Option) (*Manager, error) {
 		cfg.Logger = slog.Default()
 	}
 	return &Manager{
-		store:    store,
-		cfg:      cfg,
-		handlers: map[string]handlerEntry{},
+		store:      store,
+		cfg:        cfg,
+		handlers:   map[string]handlerEntry{},
+		queueNames: queueNames,
+		queues:     queues,
 	}, nil
 }
 
-// Enqueue inserts one task of taskType with a typed payload (any value that
-// marshals to a JSON object; use struct{}{} for no payload). Returns the id.
-// With WithUniqueKey, a conflict returns the EXISTING active task's id along
-// with an error matching ErrDuplicateTask — treat it as idempotent success
-// when that suits the caller.
-func Enqueue[T any](ctx context.Context, m *Manager, taskType string, payload T, opts ...EnqueueOption) (string, error) {
-	ids, err := EnqueueMany(ctx, m, taskType, []T{payload}, opts...)
+// Enqueue inserts one task into queue (which must be declared on this
+// manager) with a typed payload — any value that marshals to a JSON object;
+// use struct{}{} for no payload. The optional TaskPolicy carries scheduling,
+// attempts, unique-key and TTL knobs. Returns the task id. With
+// TaskPolicy.UniqueKey, a conflict returns the EXISTING active task's id
+// along with an error matching ErrDuplicateTask — treat it as idempotent
+// success when that suits the caller.
+func Enqueue[T any](ctx context.Context, m *Manager, queue, taskType string, payload T, policy ...TaskPolicy) (string, error) {
+	ids, err := EnqueueMany(ctx, m, queue, taskType, []T{payload}, policy...)
 	if err != nil {
 		var dup *DuplicateTaskError
 		if errors.As(err, &dup) {
@@ -183,50 +202,68 @@ func Enqueue[T any](ctx context.Context, m *Manager, taskType string, payload T,
 	return ids[0], nil
 }
 
-// EnqueueMany inserts many tasks of one type in a single store round-trip.
-// All share the same options (run time, max attempts).
-func EnqueueMany[T any](ctx context.Context, m *Manager, taskType string, payloads []T, opts ...EnqueueOption) ([]string, error) {
+// EnqueueMany inserts many tasks of one type into queue in chunked store
+// round trips. All share the same TaskPolicy.
+func EnqueueMany[T any](ctx context.Context, m *Manager, queue, taskType string, payloads []T, policy ...TaskPolicy) ([]string, error) {
 	if taskType == "" {
 		return nil, errors.New("gotasks: task type is empty")
+	}
+	qp, declared := m.queues[queue]
+	if !declared {
+		return nil, fmt.Errorf("gotasks: queue %q is not declared on this manager (WithQueues)", queue)
 	}
 	if len(payloads) == 0 {
 		return nil, nil
 	}
-	eo := enqueueOptions{}
-	for _, o := range opts {
-		o(&eo)
+	if len(policy) > 1 {
+		return nil, errors.New("gotasks: at most one TaskPolicy")
 	}
-	if eo.maxAttempts == 0 {
-		eo.maxAttempts = m.cfg.DefaultMaxAttempts
+	var p TaskPolicy
+	if len(policy) == 1 {
+		p = policy[0]
 	}
-	if eo.maxAttempts < 1 {
+	// Inheritance: TaskPolicy (0 = inherit) -> QueuePolicy (0 = inherit)
+	// -> manager default.
+	if p.MaxAttempts == 0 {
+		p.MaxAttempts = qp.MaxAttempts
+	}
+	if p.MaxAttempts == 0 {
+		p.MaxAttempts = m.cfg.DefaultMaxAttempts
+	}
+	if p.MaxAttempts < 1 {
 		return nil, errors.New("gotasks: max attempts must be >= 1")
 	}
-	if eo.uniqueKey != "" && len(payloads) > 1 {
-		return nil, errors.New("gotasks: WithUniqueKey requires a single-task enqueue")
-	}
-	if eo.queue == "" {
-		eo.queue = DefaultQueue
+	if p.UniqueKey != "" && len(payloads) > 1 {
+		return nil, errors.New("gotasks: TaskPolicy.UniqueKey requires a single-task enqueue")
 	}
 	now := time.Now().UTC()
-	runAt := eo.runAt
+	runAt := p.RunAt
 	if runAt.IsZero() {
-		runAt = now.Add(eo.delay)
+		runAt = now.Add(p.Delay)
+	}
+	// Lifetime expiry, stamped once at creation but measured from run_at,
+	// so scheduled tasks don't burn TTL while waiting to become due. Mongo
+	// purges the doc when it passes, in whatever state it is in.
+	var expiresAt *time.Time
+	if qp.TTL > 0 {
+		e := runAt.UTC().Add(qp.TTL)
+		expiresAt = &e
 	}
 	tasks := make([]*Task, len(payloads))
-	for i, p := range payloads {
-		raw, err := marshalPayload(p)
+	for i, pl := range payloads {
+		raw, err := marshalPayload(pl)
 		if err != nil {
 			return nil, err
 		}
 		tasks[i] = &Task{
-			Queue:       eo.queue,
+			Queue:       queue,
 			Type:        taskType,
-			UniqueKey:   eo.uniqueKey,
+			UniqueKey:   p.UniqueKey,
 			Payload:     raw,
 			Status:      StatusPending,
-			MaxAttempts: eo.maxAttempts,
+			MaxAttempts: p.MaxAttempts,
 			RunAt:       runAt.UTC(),
+			ExpiresAt:   expiresAt,
 			CreatedAt:   now,
 			UpdatedAt:   now,
 		}
@@ -304,7 +341,7 @@ func (m *Manager) claimOptions(workerID string, lease time.Duration) ClaimOption
 	return ClaimOptions{
 		WorkerID: workerID,
 		Types:    m.types,
-		Queues:   m.cfg.Queues,
+		Queues:   m.queueNames,
 		FIFO:     m.cfg.FIFO,
 		Lease:    lease,
 	}
@@ -318,7 +355,7 @@ func (m *Manager) ExtendLease(ctx context.Context, t *Task) error {
 	if err != nil {
 		return err
 	}
-	t.LockedUntil = until
+	t.LeasedUntil = until
 	return nil
 }
 
@@ -362,7 +399,7 @@ func (m *Manager) Start() error {
 
 	if !m.cfg.DisableChangeStream {
 		if w, ok := m.store.(Watcher); ok {
-			if ch, err := w.WatchRunnable(m.claimCtx, m.types, m.cfg.Queues); err == nil {
+			if ch, err := w.WatchRunnable(m.claimCtx, m.types, m.queueNames); err == nil {
 				m.watchCh = ch
 			} else {
 				m.cfg.Logger.Info("gotasks: change-stream wakeup unavailable; polling", "reason", err)

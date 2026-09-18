@@ -90,7 +90,7 @@ func (m *Manager) batchWorkerLoop(id string) {
 
 // startOfWork reports whether this worker still owns t and may run it.
 func (m *Manager) startOfWork(t *Task) bool {
-	if !time.Now().Before(t.LockedUntil) {
+	if !time.Now().Before(t.LeasedUntil) {
 		m.cfg.Logger.Warn("gotasks: dropping task whose queue lease expired in channel",
 			"id", t.ID, "type", t.Type)
 		return false
@@ -100,7 +100,7 @@ func (m *Manager) startOfWork(t *Task) bool {
 		until, err := m.store.ExtendLease(fctx, t, m.cfg.LeaseTime)
 		cancel()
 		if err == nil {
-			t.LockedUntil = until
+			t.LeasedUntil = until
 			return true
 		}
 		if errors.Is(err, ErrLeaseLost) {

@@ -55,13 +55,15 @@ type Config struct {
 	// sustained overload. Scheduling (run_at) is enforced by the claim
 	// filter in both modes — FIFO only orders already-due tasks.
 	FIFO bool
-	// Queues is the explicit set of queues this manager consumes — like
-	// every queue system, consumers subscribe to named queues; nothing is
-	// consumed implicitly. Default: [DefaultQueue]. A task enqueued to a
-	// named queue (WithQueue) is only processed by managers listing that
-	// queue. WithQueues REPLACES the set (include DefaultQueue explicitly
-	// if the manager should serve it too).
-	Queues []string
+	// Queues is the explicit set of queues this manager works with — like
+	// every queue system (Kafka topics, SQS queues), there is no default
+	// queue and nothing is consumed implicitly. Declare each queue with
+	// WithQueue; at least one is required. Enqueueing to an undeclared
+	// queue is an error (catches typos at the call site), and Start
+	// consumes every declared queue (a produce-only manager simply never
+	// calls Start; an app producing to A while consuming B uses two
+	// managers).
+	Queues []QueuePolicy
 	// Logger receives worker/reaper diagnostics. Default slog.Default().
 	Logger *slog.Logger
 }
@@ -99,10 +101,43 @@ func WithFIFO() Option {
 	return func(c *Config) { c.FIFO = true }
 }
 
-// WithQueues sets the explicit queue subscription for this manager (see
-// Config.Queues). It replaces the default [DefaultQueue] set.
-func WithQueues(queues ...string) Option {
-	return func(c *Config) { c.Queues = queues }
+// QueuePolicy declares one queue and its policies. TTL is the queue's task
+// lifetime, measured from each task's run_at (its eligible-to-run time):
+// expires_at = run_at + TTL is stamped at creation, and MongoDB purges the
+// document when it passes — whether or not the task ran (the SQS retention
+// model; budget TTL for queue wait + retries + how long you want the result
+// visible; scheduled tasks don't burn lifetime while waiting to become
+// due). 0 = no expiry. TTL is queue-scoped by design: tasks needing a
+// different lifetime belong in a different queue.
+type QueuePolicy struct {
+	Name string
+	// TTL is the queue's total-lifetime default (see above). 0 = no expiry.
+	TTL time.Duration
+	// MaxAttempts is the queue's default attempts budget. 0 inherits the
+	// manager's DefaultMaxAttempts. TaskPolicy.MaxAttempts overrides both.
+	MaxAttempts int
+}
+
+// WithQueues declares the manager's queues (appendable across calls).
+func WithQueues(qs ...QueuePolicy) Option {
+	return func(c *Config) { c.Queues = append(c.Queues, qs...) }
+}
+
+// TaskPolicy carries the optional per-task knobs for Enqueue/EnqueueMany.
+// The zero value means "all defaults": run now, inherited max attempts
+// (queue's, else manager's), no unique key.
+type TaskPolicy struct {
+	// RunAt schedules the task for an absolute time (wins over Delay).
+	RunAt time.Time
+	// Delay schedules the task for now+Delay.
+	Delay time.Duration
+	// MaxAttempts overrides the manager's DefaultMaxAttempts; 1 =
+	// at-most-once.
+	MaxAttempts int
+	// UniqueKey makes the enqueue idempotent: at most one active
+	// (pending/running) task per key; conflicts return the existing id
+	// with an error matching ErrDuplicateTask. Single-task enqueues only.
+	UniqueKey string
 }
 
 // PipelineConfig configures pipeline mode: the high-throughput
@@ -160,48 +195,6 @@ func WithHeartbeat() Option {
 // cadence (or HeartbeatAuto for LeaseTime/3; 0 keeps it disabled).
 func WithHeartbeatInterval(d time.Duration) Option {
 	return func(c *Config) { c.HeartbeatInterval = d }
-}
-
-type enqueueOptions struct {
-	runAt       time.Time
-	delay       time.Duration
-	maxAttempts int // 0 = manager default
-	uniqueKey   string
-	queue       string // "" = DefaultQueue
-}
-
-// EnqueueOption configures a single Enqueue/EnqueueMany call.
-type EnqueueOption func(*enqueueOptions)
-
-// WithRunAt schedules the task(s) to become runnable at t (wins over WithDelay).
-func WithRunAt(t time.Time) EnqueueOption {
-	return func(o *enqueueOptions) { o.runAt = t }
-}
-
-// WithDelay schedules the task(s) to become runnable after d from now.
-func WithDelay(d time.Duration) EnqueueOption {
-	return func(o *enqueueOptions) { o.delay = d }
-}
-
-// WithMaxAttempts overrides the manager's DefaultMaxAttempts for this
-// enqueue. Use 1 for at-most-once work (never retried, stale never reclaimed).
-func WithMaxAttempts(n int) EnqueueOption {
-	return func(o *enqueueOptions) { o.maxAttempts = n }
-}
-
-// WithQueue enqueues the task(s) into a named queue (DefaultQueue when not
-// used). Managers claim from all queues unless restricted with WithQueues.
-func WithQueue(name string) EnqueueOption {
-	return func(o *enqueueOptions) { o.queue = name }
-}
-
-// WithUniqueKey makes the enqueue idempotent: at most one pending/running
-// task per key. A conflicting enqueue returns the existing task's id and an
-// error matching ErrDuplicateTask. The key is released when the task reaches
-// done or dead. Single-task Enqueue only (a batch sharing one key would just
-// dedupe itself to the first element).
-func WithUniqueKey(key string) EnqueueOption {
-	return func(o *enqueueOptions) { o.uniqueKey = key }
 }
 
 type handlerOptions struct {

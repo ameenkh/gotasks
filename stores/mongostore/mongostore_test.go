@@ -29,7 +29,6 @@ func testStore(t *testing.T) *Store {
 	s, err := New(ctx, uri,
 		WithDatabase("gotasks_test"),
 		WithCollection(coll),
-		WithRetention(time.Hour),
 	)
 	if err != nil {
 		t.Skipf("no MongoDB at %s: %v", uri, err)
@@ -47,7 +46,7 @@ func enqueueOne(t *testing.T, s *Store, taskType string, payload string, maxAtte
 	t.Helper()
 	now := time.Now().UTC()
 	ids, err := s.Enqueue(context.Background(), []*gotasks.Task{{
-		Type: taskType, Payload: []byte(payload), Status: gotasks.StatusPending,
+		Queue: "q1", Type: taskType, Payload: []byte(payload), Status: gotasks.StatusPending,
 		MaxAttempts: maxAttempts, RunAt: runAt, CreatedAt: now, UpdatedAt: now,
 	}})
 	if err != nil {
@@ -324,14 +323,15 @@ func TestRequeueDeadTask(t *testing.T) {
 	if task.ID != id || task.Attempts != 1 || len(task.Errors) != 1 {
 		t.Fatalf("requeued task state wrong: %+v", task)
 	}
-	// expires_at must have been cleared so TTL won't eat the requeued task.
+	// expires_at is the task's total lifetime, stamped at creation — the
+	// requeue must NOT have touched it (nil here, since no TTL was set).
 	var doc taskDoc
 	o, _ := oid(id)
 	if err := s.col.FindOne(ctx, map[string]any{"_id": o}).Decode(&doc); err != nil {
 		t.Fatalf("find: %v", err)
 	}
 	if doc.ExpiresAt != nil {
-		t.Fatalf("expires_at not cleared on requeue: %v", doc.ExpiresAt)
+		t.Fatalf("expires_at appeared from nowhere on requeue: %v", doc.ExpiresAt)
 	}
 	// Requeue of a non-dead task fails.
 	if err := s.Requeue(ctx, id); !errors.Is(err, gotasks.ErrNotFound) {
@@ -366,92 +366,6 @@ func TestRequeueDeadByTypeMongo(t *testing.T) {
 	}
 }
 
-func TestPerTypeRetention(t *testing.T) {
-	uri := os.Getenv("GOTASKS_TEST_MONGO_URI")
-	if uri == "" {
-		uri = "mongodb://localhost:27017"
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	coll := fmt.Sprintf("tasks_test_%d", time.Now().UnixNano())
-	s, err := New(ctx, uri,
-		WithDatabase("gotasks_test"),
-		WithCollection(coll),
-		WithRetention(2*time.Hour),
-		WithRetentionByType(map[string]time.Duration{"email": time.Hour, "audit": 0}),
-	)
-	if err != nil {
-		t.Skipf("no MongoDB at %s: %v", uri, err)
-	}
-	t.Cleanup(func() {
-		ctx := context.Background()
-		_ = s.col.Drop(ctx)
-		_ = s.Close(ctx)
-	})
-	bg := context.Background()
-	now := time.Now().UTC()
-
-	expiresOf := func(id string) *time.Time {
-		var doc taskDoc
-		o, _ := oid(id)
-		if err := s.col.FindOne(bg, map[string]any{"_id": o}).Decode(&doc); err != nil {
-			t.Fatalf("find %s: %v", id, err)
-		}
-		return doc.ExpiresAt
-	}
-	within := func(got *time.Time, want time.Duration) bool {
-		if got == nil {
-			return false
-		}
-		d := got.Sub(now)
-		return d > want-time.Minute && d < want+time.Minute
-	}
-
-	// Complete path: per-type override, default, and keep-forever.
-	ids := map[string]string{}
-	for _, typ := range []string{"email", "other", "audit"} {
-		ids[typ] = enqueueOne(t, s, typ, `{"x":1}`, 3, now)
-		task := claimOne(t, s, "w1")
-		if err := s.Complete(bg, task, nil); err != nil {
-			t.Fatalf("Complete %s: %v", typ, err)
-		}
-	}
-	if e := expiresOf(ids["email"]); !within(e, time.Hour) {
-		t.Errorf("email expires_at = %v, want ~now+1h", e)
-	}
-	if e := expiresOf(ids["other"]); !within(e, 2*time.Hour) {
-		t.Errorf("other expires_at = %v, want ~now+2h (default)", e)
-	}
-	if e := expiresOf(ids["audit"]); e != nil {
-		t.Errorf("audit expires_at = %v, want none (keep forever)", e)
-	}
-
-	// Reap path: the $switch pipeline must apply the same per-type rules.
-	reapIDs := map[string]string{}
-	for _, typ := range []string{"email", "other", "audit"} {
-		reapIDs[typ] = enqueueOne(t, s, typ, `{"x":1}`, 1, now)
-		claimOne(t, s, "dead") // claim then abandon
-	}
-	if _, err := s.col.UpdateMany(bg,
-		map[string]any{"status": string(gotasks.StatusRunning)},
-		map[string]any{"$set": map[string]any{"locked_until": now.Add(-time.Minute)}}); err != nil {
-		t.Fatalf("expire leases: %v", err)
-	}
-	n, err := s.ReapExpired(bg)
-	if err != nil || n != 3 {
-		t.Fatalf("ReapExpired = %d, %v; want 3", n, err)
-	}
-	if e := expiresOf(reapIDs["email"]); !within(e, time.Hour) {
-		t.Errorf("reaped email expires_at = %v, want ~now+1h", e)
-	}
-	if e := expiresOf(reapIDs["other"]); !within(e, 2*time.Hour) {
-		t.Errorf("reaped other expires_at = %v, want ~now+2h", e)
-	}
-	if e := expiresOf(reapIDs["audit"]); e != nil {
-		t.Errorf("reaped audit expires_at = %v, want none", e)
-	}
-}
-
 func TestClaimBatchBasics(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
@@ -476,8 +390,8 @@ func TestClaimBatchBasics(t *testing.T) {
 		if task.LeaseToken != token {
 			t.Errorf("batch tasks must share one lease token")
 		}
-		if task.LockedUntil.Before(now.Add(80 * time.Second)) {
-			t.Errorf("queue lease not applied: %v", task.LockedUntil)
+		if task.LeasedUntil.Before(now.Add(80 * time.Second)) {
+			t.Errorf("queue lease not applied: %v", task.LeasedUntil)
 		}
 	}
 
@@ -636,7 +550,7 @@ func TestQueueFieldAndFiltering(t *testing.T) {
 	}
 	emailID := mk("emails")
 	mk("reports")
-	defaulted := mk("") // store defaults empty to DefaultQueue
+	other := mk("other")
 
 	// A manager restricted to "emails" sees only that queue.
 	task, err := s.Claim(ctx, gotasks.ClaimOptions{WorkerID: "w1", Queues: []string{"emails"}, Lease: time.Minute})
@@ -648,15 +562,11 @@ func TestQueueFieldAndFiltering(t *testing.T) {
 	}
 
 	// Batch claim with a queue filter.
-	batch, err := s.ClaimBatch(ctx, gotasks.ClaimOptions{WorkerID: "f1", Queues: []string{"reports", gotasks.DefaultQueue}, Lease: time.Minute}, 10)
+	batch, err := s.ClaimBatch(ctx, gotasks.ClaimOptions{WorkerID: "f1", Queues: []string{"reports", "other"}, Lease: time.Minute}, 10)
 	if err != nil || len(batch) != 2 {
 		t.Fatalf("queue batch: %d, %v; want 2", len(batch), err)
 	}
-	for _, task := range batch {
-		if task.ID == defaulted && task.Queue != gotasks.DefaultQueue {
-			t.Errorf("empty queue not defaulted: %+v", task)
-		}
-	}
+	_ = other
 }
 
 // watchStore opens WatchRunnable and skips the test when change streams are

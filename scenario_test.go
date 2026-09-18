@@ -72,6 +72,7 @@ func newScenario(t *testing.T, name string, opts ...gotasks.Option) *scenario {
 	}
 
 	base := []gotasks.Option{
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "default"}),
 		gotasks.WithWorkers(4),
 		gotasks.WithPollInterval(50 * time.Millisecond),
 		gotasks.WithLeaseTime(30 * time.Second),
@@ -191,7 +192,7 @@ func TestScenarioSteadyThroughput(t *testing.T) {
 	sc.start()
 
 	enqueued := sc.produce(10*time.Millisecond, func(i int64) {
-		if _, err := gotasks.Enqueue(ctx, sc.m, "work", struct{ N int64 }{N: i}); err != nil {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "default", "work", struct{ N int64 }{N: i}); err != nil {
 			t.Errorf("enqueue %d: %v", i, err)
 		}
 	})
@@ -241,7 +242,7 @@ func TestScenarioFlakyRetries(t *testing.T) {
 	enqueued := sc.produce(15*time.Millisecond, func(i int64) {
 		fails := plan[i%int64(len(plan))]
 		perPlan[fails]++
-		if _, err := gotasks.Enqueue(ctx, sc.m, "flaky", flaky{FailTimes: fails}); err != nil {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "default", "flaky", flaky{FailTimes: fails}); err != nil {
 			t.Errorf("enqueue %d: %v", i, err)
 		}
 	})
@@ -295,8 +296,8 @@ func TestScenarioScheduled(t *testing.T) {
 	enqueued := sc.produce(100*time.Millisecond, func(i int64) {
 		delay := time.Duration(1+i%8) * time.Second
 		runAt := time.Now().Add(delay)
-		if _, err := gotasks.Enqueue(ctx, sc.m, "timed", timed{RunAt: runAt},
-			gotasks.WithRunAt(runAt)); err != nil {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "default", "timed", timed{RunAt: runAt},
+			gotasks.TaskPolicy{RunAt: runAt}); err != nil {
 			t.Errorf("enqueue %d: %v", i, err)
 		}
 	})
@@ -349,8 +350,8 @@ func TestScenarioUniqueKeys(t *testing.T) {
 	var accepted, deduped atomic.Int64
 	sc.produce(5*time.Millisecond, func(i int64) {
 		key := fmt.Sprintf("key-%d", i%keys)
-		_, err := gotasks.Enqueue(ctx, sc.m, "keyed", keyed{Key: key},
-			gotasks.WithUniqueKey(key))
+		_, err := gotasks.Enqueue(ctx, sc.m, "default", "keyed", keyed{Key: key},
+			gotasks.TaskPolicy{UniqueKey: key})
 		switch {
 		case errors.Is(err, gotasks.ErrDuplicateTask):
 			deduped.Add(1)
@@ -401,7 +402,7 @@ func TestScenarioHeartbeatLongTasks(t *testing.T) {
 
 	// 8 workers x 2s tasks = 4 tasks/sec capacity; enqueue at ~2.5/sec.
 	enqueued := sc.produce(400*time.Millisecond, func(i int64) {
-		if _, err := gotasks.Enqueue(ctx, sc.m, "long", struct{ N int64 }{N: i}); err != nil {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "default", "long", struct{ N int64 }{N: i}); err != nil {
 			t.Errorf("enqueue %d: %v", i, err)
 		}
 	})
@@ -450,8 +451,8 @@ func TestScenarioAtMostOnce(t *testing.T) {
 		if fail {
 			wantDead++
 		}
-		if _, err := gotasks.Enqueue(ctx, sc.m, "once", once{ShouldFail: fail},
-			gotasks.WithMaxAttempts(1)); err != nil {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "default", "once", once{ShouldFail: fail},
+			gotasks.TaskPolicy{MaxAttempts: 1}); err != nil {
 			t.Errorf("enqueue %d: %v", i, err)
 		}
 	})
@@ -493,7 +494,7 @@ func TestScenarioBatchMode(t *testing.T) {
 	sc.start()
 
 	enqueued := sc.produce(5*time.Millisecond, func(i int64) {
-		if _, err := gotasks.Enqueue(ctx, sc.m, "work", struct{ N int64 }{N: i}); err != nil {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "default", "work", struct{ N int64 }{N: i}); err != nil {
 			t.Errorf("enqueue %d: %v", i, err)
 		}
 	})
@@ -547,7 +548,7 @@ func TestScenarioChangeStreamLatency(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // let workers reach their idle wait
 
 	enqueued := sc.produce(500*time.Millisecond, func(i int64) {
-		if _, err := gotasks.Enqueue(ctx, sc.m, "ping", timed{SentAt: time.Now()}); err != nil {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "default", "ping", timed{SentAt: time.Now()}); err != nil {
 			t.Errorf("enqueue %d: %v", i, err)
 		}
 	})
@@ -613,7 +614,7 @@ func TestScenarioBatchFinalize(t *testing.T) {
 	sc.start()
 
 	enqueued := sc.produce(5*time.Millisecond, func(i int64) {
-		if _, err := gotasks.Enqueue(ctx, sc.m, "work", struct{ N int64 }{N: i}); err != nil {
+		if _, err := gotasks.Enqueue(ctx, sc.m, "default", "work", struct{ N int64 }{N: i}); err != nil {
 			t.Errorf("enqueue %d: %v", i, err)
 		}
 	})

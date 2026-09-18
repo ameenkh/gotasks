@@ -31,6 +31,7 @@ func main() {
 	}
 
 	m, err := gotasks.New(store,
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "reminders"}),
 		gotasks.WithWorkers(2),
 		gotasks.WithPollInterval(200*time.Millisecond),
 	)
@@ -57,18 +58,18 @@ func main() {
 	for i := 1; i <= total-1; i++ {
 		delay := time.Duration(i) * time.Second
 		due := time.Now().Add(delay)
-		_, err := gotasks.Enqueue(ctx, m, "reminder",
+		_, err := gotasks.Enqueue(ctx, m, "reminders", "reminder",
 			Reminder{Text: fmt.Sprintf("after %s", delay), DueAt: due},
-			gotasks.WithDelay(delay))
+			gotasks.TaskPolicy{Delay: delay})
 		if err != nil {
 			log.Fatal(err)
 		}
 	}
 	// ...and an absolute time via WithRunAt.
 	at := time.Now().Add(5 * time.Second)
-	if _, err := gotasks.Enqueue(ctx, m, "reminder",
+	if _, err := gotasks.Enqueue(ctx, m, "reminders", "reminder",
 		Reminder{Text: "at an absolute time", DueAt: at},
-		gotasks.WithRunAt(at)); err != nil {
+		gotasks.TaskPolicy{RunAt: at}); err != nil {
 		log.Fatal(err)
 	}
 

@@ -47,7 +47,7 @@ func main() {
 	// Manager 1: eight workers dedicated to the "emails" queue.
 	emailMgr, err := gotasks.New(newStore(),
 		gotasks.WithWorkers(8),
-		gotasks.WithQueues("emails"),
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "emails", TTL: 24 * time.Hour}),
 		gotasks.WithPollInterval(200*time.Millisecond),
 	)
 	if err != nil {
@@ -64,7 +64,7 @@ func main() {
 	// Manager 2: two workers dedicated to the "reports" queue.
 	reportMgr, err := gotasks.New(newStore(),
 		gotasks.WithWorkers(2),
-		gotasks.WithQueues("reports"),
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "reports"}),
 		gotasks.WithPollInterval(200*time.Millisecond),
 	)
 	if err != nil {
@@ -83,13 +83,11 @@ func main() {
 	for i := range emails {
 		emails[i] = Job{N: i}
 	}
-	if _, err := gotasks.EnqueueMany(ctx, emailMgr, "send", emails,
-		gotasks.WithQueue("emails")); err != nil {
+	if _, err := gotasks.EnqueueMany(ctx, emailMgr, "emails", "send", emails); err != nil {
 		log.Fatal(err)
 	}
 	for i := 0; i < 5; i++ {
-		if _, err := gotasks.Enqueue(ctx, reportMgr, "generate", Job{N: i},
-			gotasks.WithQueue("reports")); err != nil {
+		if _, err := gotasks.Enqueue(ctx, reportMgr, "reports", "generate", Job{N: i}); err != nil {
 			log.Fatal(err)
 		}
 	}

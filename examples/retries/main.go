@@ -34,6 +34,7 @@ func main() {
 	}
 
 	m, err := gotasks.New(store,
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "jobs"}),
 		gotasks.WithWorkers(2),
 		gotasks.WithPollInterval(200*time.Millisecond),
 		gotasks.WithDefaultMaxAttempts(3),
@@ -72,7 +73,7 @@ func main() {
 		{Name: "hopeless", FailTimes: 99},  // exhausts 3 attempts -> dead
 	}
 	for _, j := range jobs {
-		if _, err := gotasks.Enqueue(ctx, m, "flaky", j); err != nil {
+		if _, err := gotasks.Enqueue(ctx, m, "jobs", "flaky", j); err != nil {
 			log.Fatal(err)
 		}
 	}

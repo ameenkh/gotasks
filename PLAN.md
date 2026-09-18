@@ -16,7 +16,7 @@ Module: `github.com/ameenkh/gotasks`
   down. `attempts` is incremented atomically by the claim itself, so a claim
   *is* an attempt — a worker that dies mid-task has still consumed one.
 - **Stale tasks**: the claim query reclaims `running` tasks whose
-  `locked_until` has passed, **but only while `attempts < max_attempts`**.
+  `leased_until` has passed, **but only while `attempts < max_attempts`**.
   So `max_attempts=1` = at-most-once (a stale task is dropped, never re-run).
   A reaper periodically marks stale+exhausted tasks `failed` with a
   "lease expired" error so drops are visible, not zombies.
@@ -42,7 +42,7 @@ Module: `github.com/ameenkh/gotasks`
 ## v0.1 — Core (this milestone)
 
 - [x] Task model: id, type, payload, status (pending/running/done/failed),
-      attempts/max_attempts, run_at, locked_by/locked_until, lease_token,
+      attempts/max_attempts, run_at, leased_by/leased_until, lease_token,
       errors array (`{at, attempt, worker, message}`), result, timestamps
 - [x] `Store` interface: Enqueue (batch), Claim, Complete, Fail, ExtendLease,
       ReapExpired, Close
@@ -125,7 +125,7 @@ Module: `github.com/ameenkh/gotasks`
       pipeline per manager; per-queue pools today = one manager per queue
       (same process, shared client via FromClient). Phase 2 (below) will
       internalize N pipelines in one manager.
-      - Start-of-work handshake at dequeue: if the in-memory locked_until
+      - Start-of-work handshake at dequeue: if the in-memory leased_until
         already passed → drop locally, no RTT, zero side effects (a
         reclaimer owns it, or the reaper will surface it). Otherwise one
         ExtendLease(task lease): success → we provably own it, run;
@@ -180,7 +180,7 @@ Module: `github.com/ameenkh/gotasks`
         (max(4x flush interval, 2s)) finalize immediately instead of
         buffering — no added cost, no added risk for the risky ones.
       - Deadline trigger: flusher force-flushes when the earliest buffered
-        LockedUntil approaches the margin (min-tracking, same shape as the
+        LeasedUntil approaches the margin (min-tracking, same shape as the
         change-stream timer), so a buffered outcome cannot outlive its
         lease while the process is alive.
       - max_attempts=1 outcomes NEVER buffer (prevents "succeeded but
@@ -228,7 +228,7 @@ Module: `github.com/ameenkh/gotasks`
       1. "queue_claim" (queue, status, run_at, _id) — THE claim index +
          FIFO order; usable by every claim because queue subscription is
          explicit (see below)
-      2. (status, locked_until) — stale reclaim, reaper, RequeueDead prefix
+      2. (status, leased_until) — stale reclaim, reaper, RequeueDead prefix
       3. "expires_at_ttl" (expires_at) TTL, SPARSE — finished tasks only;
          pending inserts don't write into it
       4. (unique_key) unique, partial $exists — active keyed tasks only
@@ -256,6 +256,52 @@ Module: `github.com/ameenkh/gotasks`
       mongostore.WithQueueClaimIndex() removed (lived <1 day, pre-release).
       Changelog: "managers now consume only their configured queues
       (default: default); tasks in other queues require WithQueues".
+
+## Task lifetime TTL + addressing API (2026-09-18 — BREAKING, ships as v0.6.0)
+
+- [x] TTL semantics pivot: expires_at = run_at + QueuePolicy.TTL, stamped
+      once at creation (SQS retention model, measured from eligibility so
+      scheduled tasks don't burn lifetime before coming due) — purges tasks
+      in ANY state, including never-consumed-but-due backlog and
+      (documented footgun) mid-run. All finalize-time retention machinery
+      deleted from the store (WithRetention / WithRetentionByType /
+      retentionFor / reaper retention expressions). Requeue no longer
+      clears expires_at — a revived task keeps its original lifetime,
+      which doubles as dead-letter retention. TTL is QUEUE-SCOPED ONLY
+      (0 = no expiry): per-task TTL and NoExpiry were implemented then
+      removed same day (challenged by Ameen) — the queue is the policy
+      boundary; a different lifetime means a different queue, and the
+      run_at-based stamp closes the scheduled-task purge trap that
+      per-task TTL had been quietly covering. Type-level retention
+      dropped: give the type its own queue.
+- [x] Addressing/config API consolidation (struct-config style):
+      - No default queue (like Kafka/SQS): every queue declared via
+        repeatable WithQueues(QueuePolicy{Name, TTL, MaxAttempts}); at least
+        one required; enqueue to an undeclared queue errors (kills the
+        typo'd-queue black hole); Start consumes all declared queues
+        (produce-only manager: never Start; produce-A-consume-B: two
+        managers).
+      - Enqueue[T](ctx, m, queue, taskType, payload, ...TaskPolicy):
+        queue+type positional and mandatory (empty type rejected — a
+        handlerless task is unclaimable); TaskPolicy replaces ALL enqueue
+        options (RunAt, Delay, MaxAttempts, UniqueKey, TTL); zero values
+        inherit queue policy then manager defaults.
+      - Removed: DefaultQueue const, WithQueues, WithRunAt/WithDelay/
+        WithMaxAttempts/WithUniqueKey/WithTTL enqueue options,
+        store retention options.
+
+## Lease terminology + queue declaration polish (2026-09-18, part of v0.6.0)
+
+- [x] Field rename for one vocabulary: locked_until -> leased_until,
+      locked_by -> leased_by (matches lease_token / LeaseTime / QueueLease /
+      ExtendLease). Index is now (status, leased_until). Migration for
+      pre-v0.6 collections (do BEFORE starting v0.6 workers, ideally
+      drained): db.tasks.updateMany({}, {$rename: {"locked_until":
+      "leased_until", "locked_by": "leased_by"}}) and drop the old
+      "status_1_locked_until_1" index.
+- [x] WithQueues(...QueuePolicy) variadic replaces repeatable
+      WithQueue(QueuePolicy) — no WithQueue(QueuePolicy{...}) stutter, one
+      declaration site, still appendable across calls.
 
 ## v1.0 — Ecosystem
 

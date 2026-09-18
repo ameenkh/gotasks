@@ -30,10 +30,12 @@ go get github.com/ameenkh/gotasks
 ```go
 store, err := mongostore.New(ctx, "mongodb://localhost:27017",
     mongostore.WithDatabase("myapp"),
-    mongostore.WithRetention(7*24*time.Hour), // auto-prune finished tasks
 )
 
 m, err := gotasks.New(store,
+    // Queues are explicit, like Kafka topics — no default queue exists.
+    // TTL = task lifetime measured from run_at (0 = keep forever).
+    gotasks.WithQueues(gotasks.QueuePolicy{Name: "emails", TTL: 7 * 24 * time.Hour}),
     gotasks.WithWorkers(8),
     gotasks.WithLeaseTime(time.Minute),
 )
@@ -48,17 +50,18 @@ gotasks.RegisterHandler(m, "email",
         return sendEmail(ctx, p) // returned value is stored as the task result
     })
 
-// From anywhere (workers optional in the enqueuing process):
-id, err := gotasks.Enqueue(ctx, m, "email", EmailPayload{To: "a@b.c", Subject: "hi"})
+// From anywhere (workers optional in the enqueuing process); addressing is
+// positional (queue, then type), knobs go in an optional TaskPolicy:
+id, err := gotasks.Enqueue(ctx, m, "emails", "email", EmailPayload{To: "a@b.c", Subject: "hi"})
 
-// Scheduled / delayed / at-most-once / idempotent:
-gotasks.Enqueue(ctx, m, "email", p, gotasks.WithRunAt(tomorrow))
-gotasks.Enqueue(ctx, m, "email", p, gotasks.WithDelay(10*time.Minute))
-gotasks.Enqueue(ctx, m, "provision", p, gotasks.WithMaxAttempts(1))
+// Scheduled / delayed / at-most-once / idempotent / custom lifetime:
+gotasks.Enqueue(ctx, m, "emails", "email", p, gotasks.TaskPolicy{RunAt: tomorrow})
+gotasks.Enqueue(ctx, m, "emails", "email", p, gotasks.TaskPolicy{Delay: 10 * time.Minute})
+gotasks.Enqueue(ctx, m, "emails", "provision", p, gotasks.TaskPolicy{MaxAttempts: 1})
 
 // At most one active task per key; a conflict returns the existing id
 // and an error matching gotasks.ErrDuplicateTask:
-id, err = gotasks.Enqueue(ctx, m, "sync", p, gotasks.WithUniqueKey("tenant-42"))
+id, err = gotasks.Enqueue(ctx, m, "emails", "sync", p, gotasks.TaskPolicy{UniqueKey: "tenant-42"})
 
 // Dead-letter management:
 m.Requeue(ctx, id)             // reset one dead task (attempts back to 0)
@@ -90,7 +93,7 @@ pending ──claim (atomic, +1 attempt, new lease)──▶ running ──ok─
   handler's context is cancelled. **Off by default**: without it, make sure
   LeaseTime exceeds your longest handler run (or call `Manager.ExtendLease`
   from inside the handler).
-- A `running` task whose lease (`locked_until`) expired is **reclaimed** by
+- A `running` task whose lease (`leased_until`) expired is **reclaimed** by
   the next claim — but only while `attempts < max_attempts`. Setting
   `max_attempts: 1` therefore gives at-most-once execution: never retried on
   error, never re-run after a worker dies.
@@ -206,19 +209,24 @@ batched finalization (compare the NoFinalize row) removes that too. What
 remains is per-op latency of the remaining point-writes — far better on
 production Linux/Atlas than on this laptop setup.
 
-## Retention
+## Task lifetime (TTL)
 
-Finished tasks (done/dead) can auto-prune via a TTL index:
+Every task in a TTL'd queue gets `expires_at = run_at + QueuePolicy.TTL`,
+stamped once at creation — the SQS retention model, measured from the
+moment the task becomes *eligible*, so scheduled tasks don't burn lifetime
+while waiting to come due. When it passes, MongoDB purges the task **in
+whatever state it is in**: done, dead, pending under a backlog, mid-retry,
+even while a handler runs (that handler's finalize is then fenced off and
+logged). Budget it as `queue wait + retries + how long the result should
+stay visible` — an unconsumed-but-due task purges too; bounded queue growth
+is the feature.
 
-```go
-mongostore.New(ctx, uri,
-    mongostore.WithRetention(7*24*time.Hour), // default for all types
-    mongostore.WithRetentionByType(map[string]time.Duration{
-        "email":     24 * time.Hour, // noisy, short-lived
-        "provision": 0,              // money trail: keep forever
-    }),
-)
-```
+TTL is **queue-scoped by design** (`0` = the queue's tasks never expire):
+tasks needing a different lifetime belong in a different queue — the queue
+is the policy boundary. `Requeue` does NOT reset the deadline — a revived
+task keeps its original lifetime, which doubles as dead-letter retention.
+`QueuePolicy` also carries `MaxAttempts` (TaskPolicy → queue →
+manager-default inheritance).
 
 ## Requirements
 

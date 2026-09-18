@@ -33,6 +33,7 @@ func main() {
 	}
 
 	m, err := gotasks.New(store,
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "notifications"}),
 		gotasks.WithWorkers(8),
 		gotasks.WithPipelineMode(gotasks.PipelineConfig{ClaimBatch: 16}), // pipeline mode
 		gotasks.WithPollInterval(time.Second), // irrelevant while the queue is busy
@@ -59,7 +60,7 @@ func main() {
 	}
 
 	t0 := time.Now()
-	ids, err := gotasks.EnqueueMany(ctx, m, "notify", payloads)
+	ids, err := gotasks.EnqueueMany(ctx, m, "notifications", "notify", payloads)
 	if err != nil {
 		log.Fatal(err)
 	}

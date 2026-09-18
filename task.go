@@ -2,7 +2,7 @@
 // Tasks live in a pluggable store (MongoDB first); a pool of workers claims
 // them atomically (one claim = one attempt), runs a typed handler per task
 // type, and retries failures with backoff. Scheduling is done via run_at;
-// every claim takes a lease (locked_until + lease_token) so a task whose
+// every claim takes a lease (leased_until + lease_token) so a task whose
 // worker died is reclaimed once the lease expires — never run twice at once.
 package gotasks
 
@@ -32,14 +32,11 @@ type TaskError struct {
 	Message string    `bson:"message" json:"message"`
 }
 
-// DefaultQueue is the queue tasks land in unless WithQueue says otherwise.
-const DefaultQueue = "default"
-
 // Task is one unit of work. Payload and Result are JSON; use the typed
 // Enqueue / RegisterHandler API instead of touching them directly.
 type Task struct {
 	ID          string          `json:"id"`
-	Queue       string          `json:"queue"` // logical queue name (DefaultQueue unless set)
+	Queue       string          `json:"queue"` // logical queue name (explicit; no default queue exists)
 	Type        string          `json:"type"`
 	UniqueKey   string          `json:"unique_key,omitempty"` // dedup key: at most one pending/running task per key
 	Payload     json.RawMessage `json:"payload,omitempty"`
@@ -47,8 +44,9 @@ type Task struct {
 	Attempts    int             `json:"attempts"`     // claims so far (a claim IS an attempt)
 	MaxAttempts int             `json:"max_attempts"` // 1 = at-most-once: never retried, stale never reclaimed
 	RunAt       time.Time       `json:"run_at"`       // eligible-to-run time (scheduling / retry backoff)
-	LockedBy    string          `json:"locked_by,omitempty"`
-	LockedUntil time.Time       `json:"locked_until,omitempty"`
+	ExpiresAt   *time.Time      `json:"expires_at,omitempty"` // total-lifetime purge deadline, stamped at creation; nil = never
+	LeasedBy    string          `json:"leased_by,omitempty"`
+	LeasedUntil time.Time       `json:"leased_until,omitempty"`
 	LeaseToken  string          `json:"-"` // fencing token; regenerated on every claim
 	Errors      []TaskError     `json:"errors,omitempty"`
 	Result      json.RawMessage `json:"result,omitempty"`

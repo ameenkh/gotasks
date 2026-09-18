@@ -32,6 +32,7 @@ func main() {
 	}
 
 	m, err := gotasks.New(store,
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "encodes"}),
 		gotasks.WithWorkers(4), // several workers: any of them COULD reclaim a stale task
 		gotasks.WithPollInterval(200*time.Millisecond),
 		gotasks.WithLeaseTime(2*time.Second),
@@ -59,7 +60,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if _, err := gotasks.Enqueue(ctx, m, "encode", Encode{File: "movie.mkv"}); err != nil {
+	if _, err := gotasks.Enqueue(ctx, m, "encodes", "encode", Encode{File: "movie.mkv"}); err != nil {
 		log.Fatal(err)
 	}
 	if err := m.Start(); err != nil {

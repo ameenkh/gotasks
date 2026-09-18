@@ -60,13 +60,13 @@ func (e *DuplicateTaskError) Is(target error) bool { return target == ErrDuplica
 
 // ClaimOptions parameterizes Claim and ClaimBatch.
 type ClaimOptions struct {
-	// WorkerID is recorded on the task as locked_by.
+	// WorkerID is recorded on the task as leased_by.
 	WorkerID string
 	// Types restricts claims to these task types; empty = all types.
 	Types []string
 	// Queues restricts claims to these queues. Empty = all queues, a
 	// store-level convenience for tests/tools: the manager always supplies
-	// at least [DefaultQueue], and the claim index requires the clause.
+	// its declared queue names, and the claim index requires the clause.
 	Queues []string
 	// FIFO requests oldest-first claim order ((run_at, id) ascending).
 	// False (the default) lets the store pick whichever runnable task is
@@ -128,9 +128,9 @@ type Store interface {
 	Enqueue(ctx context.Context, tasks []*Task) ([]string, error)
 
 	// Claim atomically takes one runnable task and returns it with
-	// Status=running, Attempts incremented, and a fresh LeaseToken/LockedUntil.
+	// Status=running, Attempts incremented, and a fresh LeaseToken/LeasedUntil.
 	// Runnable means: (pending AND run_at <= now) OR
-	// (running AND locked_until < now AND attempts < max_attempts).
+	// (running AND leased_until < now AND attempts < max_attempts).
 	// Returns ErrNoTask when nothing matches.
 	Claim(ctx context.Context, opts ClaimOptions) (*Task, error)
 
@@ -152,7 +152,7 @@ type Store interface {
 	// task becomes dead and its unique key is released.
 	Fail(ctx context.Context, t *Task, taskErr TaskError, retryAt time.Time, terminal bool) error
 
-	// ExtendLease pushes t's locked_until to now+lease and returns the new
+	// ExtendLease pushes t's leased_until to now+lease and returns the new
 	// deadline. Used by the manager's heartbeat for long-running handlers.
 	ExtendLease(ctx context.Context, t *Task, lease time.Duration) (time.Time, error)
 

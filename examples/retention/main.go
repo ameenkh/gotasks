@@ -1,8 +1,10 @@
-// Retention: finished tasks (done/dead) can auto-prune via MongoDB's TTL
-// index. WithRetention sets the default; WithRetentionByType overrides it
-// per task type (0 = keep that type's finished tasks forever). Pending and
-// running tasks are never pruned — expires_at is only set when a task
-// finishes.
+// Task lifetime (TTL): expires_at = run_at + QueuePolicy.TTL, stamped at
+// creation; MongoDB purges the document when it passes — done, dead, or
+// never consumed (the SQS retention model). Measured from run_at, so
+// scheduled tasks don't burn lifetime while waiting to become due. Budget
+// a TTL for: queue wait + retries + how long the result should stay
+// visible. TTL is queue-scoped by design (0 = keep forever) — tasks
+// needing a different lifetime belong in a different queue.
 package main
 
 import (
@@ -25,20 +27,15 @@ func main() {
 
 	store, err := mongostore.New(ctx, "mongodb://localhost:27017",
 		mongostore.WithDatabase("gotasks_examples"),
-		mongostore.WithCollection("retention"),
-		// Default: finished tasks prune after 7 days...
-		mongostore.WithRetention(7*24*time.Hour),
-		// ...except these types:
-		mongostore.WithRetentionByType(map[string]time.Duration{
-			"email": time.Minute,      // noisy: gone a minute after finishing
-			"audit": 0,                 // money trail: kept forever
-		}),
+		mongostore.WithCollection("ttl"),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	m, err := gotasks.New(store,
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "emails", TTL: time.Minute}), // gone a minute after creation
+		gotasks.WithQueues(gotasks.QueuePolicy{Name: "audit"}),                    // TTL 0 = kept forever
 		gotasks.WithWorkers(2),
 		gotasks.WithPollInterval(100*time.Millisecond),
 	)
@@ -52,32 +49,39 @@ func main() {
 		done.Add(1)
 		return nil, nil
 	}
-	for _, typ := range []string{"email", "audit", "report"} {
+	for _, typ := range []string{"send", "record"} {
 		if err := gotasks.RegisterHandler(m, typ, handler); err != nil {
 			log.Fatal(err)
 		}
 	}
 
-	for i, typ := range []string{"email", "audit", "report"} {
-		if _, err := gotasks.Enqueue(ctx, m, typ, Payload{N: i}); err != nil {
-			log.Fatal(err)
-		}
+	// Queue TTL from now, queue TTL measured from a future run_at, forever.
+	if _, err := gotasks.Enqueue(ctx, m, "emails", "send", Payload{N: 1}); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := gotasks.Enqueue(ctx, m, "emails", "send", Payload{N: 2},
+		gotasks.TaskPolicy{Delay: 30 * time.Second}); err != nil { // expires at run_at+1m, not created+1m
+		log.Fatal(err)
+	}
+	if _, err := gotasks.Enqueue(ctx, m, "audit", "record", Payload{N: 3}); err != nil {
+		log.Fatal(err)
 	}
 	if err := m.Start(); err != nil {
 		log.Fatal(err)
 	}
-	for done.Load() < 3 {
+	for done.Load() < 2 { // #2 runs after its 30s delay; don't wait for it here
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	fmt.Println("all three tasks are done; their expires_at is now set as:")
-	fmt.Println("  email  -> ~1 minute from now  (per-type override)")
-	fmt.Println("  report -> ~7 days from now    (default retention)")
-	fmt.Println("  audit  -> never               (per-type 0 = keep forever)")
+	fmt.Println("all three tasks done; their lifetimes:")
+	fmt.Println("  emails #1 -> purged ~1 minute after run_at (= enqueue time)")
+	fmt.Println("  emails #2 -> purged ~1m30s after enqueue (run_at was +30s)")
+	fmt.Println("  audit  #3 -> never (queue TTL 0)")
 	fmt.Println()
 	fmt.Println("inspect with: mongosh gotasks_examples --eval \\")
-	fmt.Println("  'db.retention.find({},{type:1,status:1,expires_at:1})'")
-	fmt.Println("(MongoDB's TTL monitor runs about once a minute)")
+	fmt.Println("  'db.ttl.find({},{queue:1,status:1,expires_at:1})'")
+	fmt.Println("(MongoDB's TTL monitor runs about once a minute — and it will")
+	fmt.Println(" purge a task whose TTL passes even if it was never consumed)")
 
 	stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
