@@ -7,19 +7,20 @@ same task.
 
 Module: `github.com/ameenkh/gotasks`
 
-## Design decisions (locked in)
+## Design decisions (kept current — dated entries below record the history)
 
 - **IDs**: store-native (Mongo ObjectID hex), exposed as `string`. No counter
   collection — a single counter document is a global write hotspot.
-- **Ordering**: claim sorted by `(run_at, _id)` — FIFO-ish for free.
+- **Ordering**: UNSORTED claims by default since v0.3 (cheaper, spreads
+  contention); `WithFIFO()` restores oldest-first claim order.
 - **Attempts count up** (`attempts` / `max_attempts`), not retries counting
   down. `attempts` is incremented atomically by the claim itself, so a claim
   *is* an attempt — a worker that dies mid-task has still consumed one.
 - **Stale tasks**: the claim query reclaims `running` tasks whose
   `leased_until` has passed, **but only while `attempts < max_attempts`**.
   So `max_attempts=1` = at-most-once (a stale task is dropped, never re-run).
-  A reaper periodically marks stale+exhausted tasks `failed` with a
-  "lease expired" error so drops are visible, not zombies.
+  The janitor's reap duty periodically marks stale+exhausted tasks `dead`
+  with a "lease expired" error so drops are visible, not zombies.
 - **Fencing**: every claim generates a fresh `lease_token` (UUID).
   Complete/Fail/ExtendLease match on `(id, lease_token, status=running)` — a
   worker whose task was reclaimed can no longer touch it (the token changed).
@@ -35,8 +36,9 @@ Module: `github.com/ameenkh/gotasks`
   executes a decision (retry at T / terminal).
 - **Railway loop**: each worker keeps claiming as long as tasks come back;
   it sleeps `PollInterval` only after an empty claim.
-- **No golocks dependency**. Atomic claim *is* the lock. The lease concept
-  returns in v0.2 as an internal primitive for scheduler leader election.
+- **No golocks dependency**. Atomic claim *is* the lock. (A lease-style
+  primitive keeps resurfacing in parked designs — cron leader election,
+  cancellation, FIFO groups — but nothing shipped needs it.)
 - MongoDB ≥ 4.2 required (`$expr` in claim filter, pipeline updates in reaper).
 
 ## v0.1 — Core (this milestone)

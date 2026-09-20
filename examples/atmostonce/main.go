@@ -1,4 +1,4 @@
-// At-most-once: WithMaxAttempts(1) is for non-idempotent, credit-spending
+// At-most-once: TaskPolicy{MaxAttempts: 1} is for non-idempotent, credit-spending
 // work (provisioning, charging a card). The task is never retried on error,
 // and — because the claim query only reclaims stale tasks while
 // attempts < max_attempts — never re-run if its worker dies mid-task either.

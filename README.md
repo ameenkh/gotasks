@@ -102,7 +102,7 @@ pending ──claim (atomic, +1 attempt, new lease)──▶ running ──ok─
 - **`dead` is the dead-letter state**: inspect, then `Requeue(id)` or
   `RequeueDead(type)` to run again with a fresh attempts budget (the errors
   array is kept as history), or let retention prune them.
-- **Unique keys** (`WithUniqueKey`) are held while a task is pending/running
+- **Unique keys** (`TaskPolicy.UniqueKey`) are held while a task is pending/running
   (including across retries) and released at done/dead.
 - Every failed attempt is appended to the task's `errors` array
   (`{at, attempt, worker, message}`).

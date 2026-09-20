@@ -535,7 +535,7 @@ func TestUniqueKeyRejectedForBatch(t *testing.T) {
 	_, err := EnqueueMany(context.Background(), m, "default", "t",
 		[]struct{}{{}, {}}, TaskPolicy{UniqueKey: "k"})
 	if err == nil {
-		t.Fatal("expected error for WithUniqueKey on a batch")
+		t.Fatal("expected error for TaskPolicy.UniqueKey on a batch")
 	}
 }
 

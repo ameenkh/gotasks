@@ -1,6 +1,6 @@
 // Batch fan-out and throughput: EnqueueMany inserts a whole batch in one
 // store round-trip (this is how broadcast-style workloads fan one message
-// out to thousands of recipients), and WithMaxBatch enables batch-mode
+// out to thousands of recipients), and WithPipelineMode enables pipeline
 // consumption: one fetcher claims up to 16 tasks per ~3 round trips and
 // feeds the workers through a bounded channel, instead of each worker
 // paying a contended claim query per task.

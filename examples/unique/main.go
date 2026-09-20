@@ -1,4 +1,4 @@
-// Unique keys: WithUniqueKey guarantees at most one active (pending or
+// Unique keys: TaskPolicy.UniqueKey guarantees at most one active (pending or
 // running) task per key. Duplicate enqueues return the existing task's id
 // with an error matching ErrDuplicateTask — treat that as idempotent
 // success. Once the task finishes, the key is released and can be reused.

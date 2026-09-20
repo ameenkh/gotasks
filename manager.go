@@ -463,8 +463,8 @@ func (m *Manager) claimOptions(workerID string, lease time.Duration) ClaimOption
 }
 
 // ExtendLease pushes the task's lease forward by the manager's LeaseTime.
-// Rarely needed directly — the heartbeat does this automatically unless
-// disabled with WithoutHeartbeat.
+// Rarely needed directly — enable the heartbeat (WithHeartbeat) to do this
+// automatically for long-running handlers.
 func (m *Manager) ExtendLease(ctx context.Context, t *Task) error {
 	until, err := m.store.ExtendLease(ctx, t, m.cfg.LeaseTime)
 	if err != nil {

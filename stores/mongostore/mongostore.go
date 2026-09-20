@@ -3,9 +3,9 @@
 // Claiming uses a single findOneAndUpdate, so N workers across N machines
 // never take the same task. Payloads and results are stored as native BSON
 // documents (not opaque blobs) so tasks stay inspectable with mongosh/Compass.
-// Finished tasks can be auto-pruned by a TTL index via WithRetention /
-// WithRetentionByType, and unique keys are enforced with a partial unique
-// index (unique only while a task is active).
+// Task lifetime is enforced by a TTL index on expires_at (stamped at
+// enqueue from the queue's TTL policy), and unique keys are enforced with
+// a partial unique index (unique only while a task is active).
 package mongostore
 
 import (

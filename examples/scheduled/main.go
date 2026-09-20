@@ -1,5 +1,5 @@
-// Scheduled tasks: WithDelay and WithRunAt defer when a task becomes
-// runnable. Workers only claim tasks whose run_at has passed, so nothing
+// Scheduled tasks: TaskPolicy.Delay and TaskPolicy.RunAt defer when a task
+// becomes runnable. Workers only claim tasks whose run_at has passed, so nothing
 // executes early — watch the timestamps in the output.
 package main
 
@@ -54,7 +54,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Delays of 1..4 seconds via WithDelay...
+	// Delays of 1..4 seconds via TaskPolicy.Delay...
 	for i := 1; i <= total-1; i++ {
 		delay := time.Duration(i) * time.Second
 		due := time.Now().Add(delay)
@@ -65,7 +65,7 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-	// ...and an absolute time via WithRunAt.
+	// ...and an absolute time via TaskPolicy.RunAt.
 	at := time.Now().Add(5 * time.Second)
 	if _, err := gotasks.Enqueue(ctx, m, "reminders", "reminder",
 		Reminder{Text: "at an absolute time", DueAt: at},

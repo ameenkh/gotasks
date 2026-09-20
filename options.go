@@ -16,10 +16,11 @@ type Config struct {
 	PollInterval time.Duration
 	// LeaseTime is how long a claim holds a task before it becomes
 	// reclaimable by other workers. Must exceed your longest handler run
-	// (until v0.2's heartbeat lands). Default 60s.
+	// unless the heartbeat is enabled (WithHeartbeat). Default 60s.
 	LeaseTime time.Duration
-	// DefaultMaxAttempts for enqueued tasks (per-enqueue override with
-	// WithMaxAttempts). 1 = at-most-once. Default 3.
+	// DefaultMaxAttempts for enqueued tasks (override per queue via
+	// QueuePolicy.MaxAttempts or per task via TaskPolicy.MaxAttempts).
+	// 1 = at-most-once. Default 3.
 	DefaultMaxAttempts int
 	// DefaultTimeout bounds each handler run via context (per-type override
 	// with WithHandlerTimeout). 0 disables. Default 60s.

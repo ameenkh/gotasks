@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// fetcherLoop is batch mode's single claimer: it fills taskCh with batches
+// fetcherLoop is pipeline mode's single claimer: it fills taskCh with batches
 // claimed under the QUEUE lease, keeping fetch I/O overlapped with handler
 // compute. The bounded channel is the backpressure; the low-water mark
 // avoids RTT-wasteful tiny top-ups when the channel is nearly full.
