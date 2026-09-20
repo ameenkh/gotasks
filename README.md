@@ -109,6 +109,23 @@ pending ──claim (atomic, +1 attempt, new lease)──▶ running ──ok─
 
 ## Queues and ordering
 
+## Dashboard
+
+```go
+import "github.com/ameenkh/gotasks/dashboard"
+
+// Behind YOUR auth — the dashboard can requeue and delete tasks:
+mux.Handle("/gotasks/", http.StripPrefix("/gotasks", dashboard.Handler(store)))
+```
+
+An embeddable, zero-dependency web dashboard (single embedded page, no
+JavaScript build chain, no external services — it reads the same Mongo
+collections everything else uses): per-queue overview with live counts and
+oldest-due age, a task browser with filters, payload/result/error
+inspection, requeue and delete, per-queue "requeue dead", and a throughput
+chart fed by the metrics collection. Run `go run ./examples/dashboard` for
+a live demo with a workload generator.
+
 ## Metrics (Mongo-native, opt-in)
 
 ```go

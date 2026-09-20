@@ -351,11 +351,18 @@ and visibility, runs on nothing but a Go binary and a Mongo cluster
       oldest_due_age kept after challenge: it is THE queue-health alert
       signal (SQS ApproximateAgeOfOldestMessage), measured over DUE tasks
       only so scheduled tasks don't read as stale.
-- [ ] 3. UI: embeddable http.Handler (go:embed frontend + JSON API over
-      tasks/queues/metrics) mounted in the user's own service behind
-      their auth, plus a standalone cmd binary. Requeue/delete/inspect
-      first; charts from the metrics collection. Auth is explicitly the
-      host app's responsibility.
+- [x] 3. UI — implemented 2026-09-19. Package dashboard (renamed from ui, 2026-09-19): embeddable http.Handler
+      (go:embed single-page frontend, vanilla JS + hand-rolled canvas
+      chart, zero build chain / zero deps) + JSON API. Backed by new
+      mongostore introspection (ListTasks cursor-paginated, GetTask,
+      DeleteTask — operator action bypassing fencing, documented —
+      RequeueDeadByQueue, Overview, MetricsSeries with counters summed
+      across manager instances per window). Endpoints: overview, tasks
+      list/detail/requeue/delete, per-queue requeue-dead, metrics series.
+      Auth is explicitly the host app's responsibility (mount behind it).
+      Verified live via examples/dashboard (workload generator; exact
+      counter math visible in the metrics endpoint). Standalone cmd binary
+      deferred until someone wants it.
 
 ## v1.0 — Ecosystem
 

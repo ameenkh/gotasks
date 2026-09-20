@@ -17,4 +17,5 @@ go run ./examples/<name>
 | [atmostonce](atmostonce/) | `WithMaxAttempts(1)`: at-most-once execution for non-idempotent work |
 | [batch](batch/) | `EnqueueMany` fan-out, `WithMaxBatch` batch-mode consumption, and measuring throughput |
 | [queues](queues/) | Named queues: `WithQueue` routing + two managers with dedicated pools via `WithQueues` |
+| [dashboard](dashboard/) | The embeddable web dashboard (`dashboard.Handler`) with a live workload generator |
 | [retention](retention/) | Task lifetime TTL: `QueuePolicy.TTL`, measured from `run_at`, purges any state |

@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gotasks</title>
+<style>
+:root{--bg:#0f1419;--panel:#171d24;--line:#242c36;--fg:#d6dde6;--dim:#7d8a99;
+--green:#3fb96f;--red:#e05252;--amber:#d9a13c;--blue:#4f8fd9;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,system-ui,Segoe UI,sans-serif;padding:20px;max-width:1200px;margin:0 auto}
+h1{font-size:18px;letter-spacing:.3px}h1 b{color:var(--green)}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin:24px 0 10px}
+header{display:flex;align-items:center;gap:22px;border-bottom:1px solid var(--line);padding-bottom:12px}
+nav a{color:var(--dim);text-decoration:none;font-size:13px;text-transform:uppercase;letter-spacing:1px;padding:4px 2px;margin-right:14px;border-bottom:2px solid transparent}
+nav a.on{color:var(--fg);border-color:var(--green)}
+header .right{margin-left:auto;color:var(--dim);font-size:12px;display:flex;gap:8px;align-items:center}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.8px}
+tr:last-child td{border-bottom:0}
+tbody tr.rowlink:hover{background:#1d252e;cursor:pointer}
+.num{text-align:right;font-family:var(--mono)}
+.pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.pending{background:#2a3542;color:#9db4cc}.running{background:#173a5e;color:#7db8f0}
+.done{background:#15311f;color:#63c98a}.dead{background:#3a1a1a;color:#e08a8a}
+button{background:#222b35;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px}
+button:hover{border-color:var(--dim)}button:disabled{opacity:.4;cursor:default}
+button.danger{color:#e08a8a}button.danger:hover{border-color:#e05252}
+select,input{background:#12181f;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 9px;font-size:13px}
+.bar{display:flex;gap:8px;margin:0 0 10px;align-items:center;flex-wrap:wrap}
+.pager{display:flex;gap:6px;align-items:center;margin-top:8px;justify-content:flex-end;color:var(--dim);font-size:12px}
+canvas{width:100%;height:180px;background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.legend{font-size:11px;color:var(--dim);margin-top:4px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 4px 0 12px;vertical-align:-1px}
+.cards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 16px;min-width:110px}
+.card .v{font:600 20px var(--mono)}.card .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.8px}
+.crumb{color:var(--dim);font-size:13px;margin:16px 0 2px}.crumb a{color:var(--blue);text-decoration:none}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto;z-index:10}
+#modal>div{background:var(--panel);border:1px solid var(--line);border-radius:10px;max-width:760px;width:100%;padding:20px}
+#modal pre{background:#10151b;border:1px solid var(--line);border-radius:6px;padding:10px;overflow:auto;font:12px var(--mono);margin:6px 0 14px;max-height:220px}
+#modal .row{display:flex;gap:10px;justify-content:flex-end;margin-top:8px}
+.kv{font-family:var(--mono);font-size:12px;color:var(--dim);margin:10px 0}.kv b{color:var(--fg)}
+.muted{color:var(--dim)}
+#toast{position:fixed;bottom:18px;right:18px;background:#222b35;border:1px solid var(--line);border-radius:8px;padding:9px 14px;display:none;z-index:20}
+</style>
+</head>
+<body>
+<header>
+  <h1><b>go</b>tasks</h1>
+  <nav>
+    <a href="#/queues" id="navQueues">Queues</a>
+    <a href="#/tasks" id="navTasks">Tasks</a>
+  </nav>
+  <div class="right">
+    refresh
+    <select id="refreshSel">
+      <option value="10000">10s</option>
+      <option value="30000">30s</option>
+      <option value="60000">1m</option>
+      <option value="300000">5m</option>
+      <option value="0">off</option>
+    </select>
+    <span id="clock"></span>
+  </div>
+</header>
+
+<div id="view"></div>
+
+<div id="modal" onclick="if(event.target===this)this.style.display='none'"><div>
+  <h2 style="margin-top:0">Task <span id="dId" style="font-family:var(--mono);text-transform:none"></span></h2>
+  <div class="kv" id="dMeta"></div>
+  <div class="muted">payload</div><pre id="dPayload"></pre>
+  <div class="muted">result</div><pre id="dResult"></pre>
+  <div class="muted">errors</div><pre id="dErrors"></pre>
+  <div class="row">
+    <button id="dRequeue">requeue</button>
+    <button class="danger" id="dDelete">delete</button>
+    <button onclick="modal.style.display='none'">close</button>
+  </div>
+</div></div>
+<div id="toast"></div>
+
+<script>
+// ---------- helpers ----------
+const $=q=>document.querySelector(q);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const api=async(path,opts)=>{const r=await fetch('api/'+path,opts);const j=await r.json();
+  if(!r.ok)throw new Error(j.error||r.status);return j};
+const toast=m=>{const t=$('#toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',2500)};
+const age=ms=>ms<=0?'—':ms<60e3?Math.round(ms/1e3)+'s':ms<36e5?Math.round(ms/6e4)+'m':(ms/36e5).toFixed(1)+'h';
+const ttl=ns=>ns<=0?'∞':age(ns/1e6);
+const when=s=>s?new Date(s).toLocaleTimeString():'—';
+const pageInfo=(page,limit,got,total)=>{
+  if(!total)return 'no results';
+  const pages=Math.max(1,Math.ceil(total/limit)),from=page*limit+1,to=page*limit+got;
+  return `page ${page+1} of ${pages} · ${from}–${to} of ${total}`};
+
+// ---------- shared task popup ----------
+const modal=$('#modal');
+async function openTask(id){
+  const t=await api('tasks/'+id);
+  $('#dId').textContent=t.id;
+  $('#dMeta').innerHTML=`queue <b>${esc(t.queue)}</b> · type <b>${esc(t.type)}</b> · status <b>${t.status}</b>
+    · attempts <b>${t.attempts}/${t.max_attempts}</b> · run_at <b>${when(t.run_at)}</b>
+    ${t.leased_by?` · leased by <b>${esc(t.leased_by)}</b>`:''}
+    ${t.unique_key?` · key <b>${esc(t.unique_key)}</b>`:''}${t.expires_at?` · expires <b>${when(t.expires_at)}</b>`:''}`;
+  $('#dPayload').textContent=t.payload?JSON.stringify(t.payload,null,2):'—';
+  $('#dResult').textContent=t.result?JSON.stringify(t.result,null,2):'—';
+  $('#dErrors').textContent=t.errors?JSON.stringify(t.errors,null,2):'—';
+  $('#dRequeue').onclick=async()=>{try{await api('tasks/'+id+'/requeue',{method:'POST'});
+    toast('requeued');modal.style.display='none';render()}catch(e){toast(e.message)}};
+  $('#dDelete').onclick=async()=>{if(!confirm('Delete this task?'))return;
+    await api('tasks/'+id,{method:'DELETE'});toast('deleted');modal.style.display='none';render()};
+  modal.style.display='flex';
+}
+
+// ---------- shared, reusable task table (filters outside, cursor pager) ----------
+function taskTable(mount,{showQueue=true,getFilter}){
+  const el=document.createElement('div');
+  el.innerHTML=`<table><thead><tr>
+    <th>id</th>${showQueue?'<th>queue</th>':''}<th>type</th><th>status</th>
+    <th class="num">att.</th><th>run at</th><th>updated</th></tr></thead><tbody></tbody></table>
+    <div class="pager">
+      <span class="pageinfo"></span>
+      <span style="flex:1"></span>
+      limit <select class="lim"><option>25</option><option selected>50</option><option>100</option><option>200</option></select>
+      <button class="newer">⟨ newer</button><button class="older">older ⟩</button>
+    </div>`;
+  mount.appendChild(el);
+  const body=el.querySelector('tbody'),newer=el.querySelector('.newer'),
+        older=el.querySelector('.older'),info=el.querySelector('.pageinfo'),
+        lim=el.querySelector('.lim');
+  const st={cursors:[''],page:0,next:''};
+  lim.addEventListener('change',()=>{st.cursors=[''];st.page=0;load()});
+  async function load(){
+    const f={...getFilter(),limit:lim.value};
+    const p=new URLSearchParams({...f,before:st.cursors[st.page]});
+    const {tasks,next,total}=await api('tasks?'+p);
+    st.next=tasks.length===+f.limit?next:'';
+    body.innerHTML=tasks.map(t=>`<tr class="rowlink" data-id="${t.id}">
+      <td style="font-family:var(--mono);font-size:12px">${t.id.slice(-8)}</td>
+      ${showQueue?`<td>${esc(t.queue)}</td>`:''}
+      <td>${esc(t.type)}</td>
+      <td><span class="pill ${t.status}">${t.status}</span></td>
+      <td class="num">${t.attempts}/${t.max_attempts}</td>
+      <td class="muted">${when(t.run_at)}</td><td class="muted">${when(t.updated_at)}</td>
+    </tr>`).join('')||`<tr><td colspan="7" class="muted">no tasks</td></tr>`;
+    newer.disabled=st.page===0;
+    older.disabled=!st.next;
+    info.textContent=pageInfo(st.page,+lim.value,tasks.length,total);
+  }
+  body.addEventListener('click',e=>{const tr=e.target.closest('tr[data-id]');if(tr)openTask(tr.dataset.id)});
+  newer.onclick=()=>{if(st.page>0){st.page--;load()}};
+  older.onclick=()=>{if(st.next){st.cursors[st.page+1]=st.next;st.page++;load()}};
+  return{reload(){st.cursors=[''];st.page=0;return load()},refresh:load};
+}
+
+// ---------- views ----------
+const view=$('#view');
+let current={name:'',refresh:null};
+
+async function queuesView(){
+  view.innerHTML=`<h2>Queues</h2><div id="qwrap"></div>
+    <div class="pager"><span id="qinfo"></span>
+      <span style="flex:1"></span>
+      limit <select id="qLim"><option>25</option><option selected>50</option><option>100</option><option>200</option></select>
+      <button id="qNewer">⟨ newer</button><button id="qOlder">older ⟩</button></div>`;
+  const st={cursors:[''],page:0,next:''};
+  $('#qLim').addEventListener('change',()=>{st.cursors=[''];st.page=0;load()});
+  async function load(){
+    const lim=+$('#qLim').value;
+    const {queues,next,total}=await api('overview?limit='+lim+'&after='+encodeURIComponent(st.cursors[st.page]));
+    st.next=queues.length===lim?next:'';
+    $('#qwrap').innerHTML=`<table><thead><tr>
+      <th>queue</th><th>TTL</th><th>max att.</th>
+      <th class="num">pending</th><th class="num">running</th><th class="num">done</th><th class="num">dead</th>
+      <th class="num">oldest due</th><th></th></tr></thead><tbody>${
+      queues.map(q=>`<tr class="rowlink" onclick="location.hash='#/queues/${encodeURIComponent(q.name)}'">
+        <td><b>${esc(q.name)}</b></td><td class="muted">${ttl(q.ttl)}</td><td class="muted">${q.max_attempts||'·'}</td>
+        <td class="num">${q.pending}</td><td class="num">${q.running}</td>
+        <td class="num">${q.done}</td><td class="num" style="color:${q.dead?'#e08a8a':'inherit'}">${q.dead}</td>
+        <td class="num" style="color:${q.oldest_due_age_ms>6e4?'var(--amber)':'inherit'}">${age(q.oldest_due_age_ms)}</td>
+        <td>${q.dead?`<button onclick="event.stopPropagation();requeueDead('${esc(q.name)}')">requeue dead</button>`:''}</td>
+      </tr>`).join('')||'<tr><td colspan="9" class="muted">no queues registered</td></tr>'
+    }</tbody></table>`;
+    $('#qNewer').disabled=st.page===0;$('#qOlder').disabled=!st.next;
+    $('#qinfo').textContent=pageInfo(st.page,+$('#qLim').value,queues.length,total);
+    $('#qNewer').onclick=()=>{if(st.page>0){st.page--;load()}};
+    $('#qOlder').onclick=()=>{if(st.next){st.cursors[st.page+1]=st.next;st.page++;load()}};
+  }
+  current.refresh=load;
+  await load();
+}
+
+async function queueView(name){
+  view.innerHTML=`<div class="crumb"><a href="#/queues">queues</a> / <b>${esc(name)}</b></div>
+    <div class="cards" id="cards"></div>
+    <h2>Throughput <span class="muted" style="text-transform:none">— last hour</span></h2>
+    <canvas id="chart" height="180"></canvas>
+    <div class="legend"><i style="background:var(--green)"></i>done<i style="background:var(--red)"></i>failed+dead<i style="background:var(--blue)"></i>pending (line)</div>
+    <h2>Tasks</h2>
+    <div class="bar">
+      <select id="fStatus"><option value="">all statuses</option>
+        <option>pending</option><option>running</option><option>done</option><option>dead</option></select>
+      <input id="fType" placeholder="type…" size="14">
+      <button id="fApply">apply</button>
+      <span style="flex:1"></span><span id="qActions"></span>
+    </div>
+    <div id="ttWrap"></div>`;
+  const tt=taskTable($('#ttWrap'),{showQueue:false,
+    getFilter:()=>({queue:name,status:$('#fStatus').value,type:$('#fType').value})});
+  $('#fApply').onclick=()=>tt.reload();
+  async function loadHead(){
+    const q=await api('queues/'+encodeURIComponent(name));
+    $('#cards').innerHTML=`
+      <div class="card"><div class="v">${ttl(q.ttl)}</div><div class="k">ttl</div></div>
+      <div class="card"><div class="v">${q.max_attempts||'inherit'}</div><div class="k">max attempts</div></div>
+      <div class="card"><div class="v">${q.pending}</div><div class="k">pending</div></div>
+      <div class="card"><div class="v">${q.running}</div><div class="k">running</div></div>
+      <div class="card"><div class="v">${q.done}</div><div class="k">done</div></div>
+      <div class="card"><div class="v" style="color:${q.dead?'#e08a8a':'inherit'}">${q.dead}</div><div class="k">dead</div></div>
+      <div class="card"><div class="v" style="color:${q.oldest_due_age_ms>6e4?'var(--amber)':'inherit'}">${age(q.oldest_due_age_ms)}</div><div class="k">oldest due</div></div>`;
+    $('#qActions').innerHTML=q.dead?`<button onclick="requeueDead('${esc(name)}')">requeue ${q.dead} dead</button>`:'';
+  }
+  current.refresh=async()=>{await Promise.all([loadHead(),tt.refresh(),drawChart(name)])};
+  await current.refresh();
+}
+
+async function tasksView(){
+  view.innerHTML=`<h2>Tasks</h2>
+    <div class="bar">
+      <select id="fQueue"><option value="">all queues</option></select>
+      <select id="fStatus"><option value="">all statuses</option>
+        <option>pending</option><option>running</option><option>done</option><option>dead</option></select>
+      <input id="fType" placeholder="type…" size="14">
+      <button id="fApply">apply</button>
+    </div>
+    <div id="ttWrap"></div>`;
+  api('overview?limit=200').then(({queues})=>{
+    $('#fQueue').innerHTML='<option value="">all queues</option>'+
+      queues.map(q=>`<option>${esc(q.name)}</option>`).join('')}).catch(()=>{});
+  const tt=taskTable($('#ttWrap'),{showQueue:true,
+    getFilter:()=>({queue:$('#fQueue').value,status:$('#fStatus').value,type:$('#fType').value})});
+  $('#fApply').onclick=()=>tt.reload();
+  current.refresh=tt.refresh;
+  await tt.reload();
+}
+
+async function requeueDead(q){
+  const r=await api('queues/'+encodeURIComponent(q)+'/requeue-dead',{method:'POST'});
+  toast(`requeued ${r.requeued} dead tasks in ${q}`);render();
+}
+
+async function drawChart(queue){
+  const {points}=await api('metrics?since=1h&queue='+encodeURIComponent(queue));
+  const c=$('#chart');if(!c)return;
+  const dpr=devicePixelRatio||1;
+  c.width=c.clientWidth*dpr;c.height=180*dpr;
+  const g=c.getContext('2d');g.scale(dpr,dpr);
+  const W=c.clientWidth,H=180,pad=8;
+  g.clearRect(0,0,W,H);
+  if(!points.length){g.fillStyle='#7d8a99';g.font='12px sans-serif';
+    g.fillText('no metrics yet — enable WithJanitor(JanitorConfig{Metrics: …})',14,H/2);return}
+  const n=points.length,bw=Math.max(2,(W-2*pad)/n-2);
+  const maxBar=Math.max(1,...points.map(p=>p.c_done+p.c_failed+p.c_dead));
+  const maxPen=Math.max(1,...points.map(p=>p.pending));
+  points.forEach((p,i)=>{
+    const x=pad+i*((W-2*pad)/n);
+    const hd=(p.c_done/maxBar)*(H-30),hf=((p.c_failed+p.c_dead)/maxBar)*(H-30);
+    g.fillStyle='#3fb96f';g.fillRect(x,H-14-hd,bw,hd);
+    g.fillStyle='#e05252';g.fillRect(x,H-14-hd-hf,bw,hf);
+  });
+  g.strokeStyle='#4f8fd9';g.lineWidth=1.5;g.beginPath();
+  points.forEach((p,i)=>{
+    const x=pad+i*((W-2*pad)/n)+bw/2,y=H-14-(p.pending/maxPen)*(H-30);
+    i?g.lineTo(x,y):g.moveTo(x,y)});
+  g.stroke();
+  g.fillStyle='#7d8a99';g.font='10px sans-serif';
+  g.fillText(new Date(points[0].window_start).toLocaleTimeString(),pad,H-2);
+  g.fillText('max '+maxBar+'/window',W-90,10);
+}
+
+// ---------- routing + auto-refresh (10s minimum) ----------
+function route(){
+  const h=location.hash||'#/queues';
+  const m=h.match(/^#\/queues\/(.+)$/);
+  $('#navQueues').classList.toggle('on',h.startsWith('#/queues'));
+  $('#navTasks').classList.toggle('on',h==='#/tasks');
+  current.refresh=null;
+  if(m)return queueView(decodeURIComponent(m[1]));
+  if(h==='#/tasks')return tasksView();
+  return queuesView();
+}
+async function render(){
+  $('#clock').textContent=new Date().toLocaleTimeString();
+  try{if(current.refresh)await current.refresh();else await route()}
+  catch(e){toast(e.message)}
+}
+window.addEventListener('hashchange',()=>{current.refresh=null;render()});
+
+let timer=null;
+function armRefresh(){
+  clearInterval(timer);
+  const ms=+localStorage.gotasksRefresh||10000;
+  $('#refreshSel').value=String(ms);
+  if(ms>0)timer=setInterval(render,Math.max(ms,10000)); // 10s floor
+}
+$('#refreshSel').addEventListener('change',e=>{
+  localStorage.gotasksRefresh=e.target.value;armRefresh()});
+route().catch(e=>toast(e.message));
+$('#clock').textContent=new Date().toLocaleTimeString();
+armRefresh();
+</script>
+</body>
+</html>
