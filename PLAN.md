@@ -397,9 +397,17 @@ and visibility, runs on nothing but a Go binary and a Mongo cluster
       and the test audits: (1) done+dead == enqueued, zero lost; (2)
       at-most-once tasks executed <= 1 time ABSOLUTELY; (3) executions <=
       attempts <= max_attempts; (4) done implies executed. Env-gated
-      (GOTASKS_CHAOS=1, GOTASKS_CHAOS_DURATION), own CI step at 30s. First
-      run: 2563 tasks / 12 kills / 0 lost / 0 violations; 2% duplicate
-      executions — the documented at-least-once window, now measured.
+      (GOTASKS_CHAOS=1; GOTASKS_CHAOS_DURATION and GOTASKS_CHAOS_PROFILE
+      override). Two 90s profiles defined IN CODE (chaos_test.go
+      chaosProfiles — type-checked, local==CI; the fixture takes every
+      timing via env so profiles are a 5-line edit), run SEQUENTIALLY as
+      two CI steps (decided 2026-09-20: no goroutine-parallel storms —
+      2-core runners make timing assertions flake and profiles contaminate
+      each other's measurements; scale via separate CI jobs if ever
+      needed). Measured: realistic (defaults: single mode, 60s lease/reap,
+      12 kills/90s) 6202 tasks, 0 lost, 0.1% duplicates; aggressive
+      (pipeline, 2s leases, 123 kills/90s) 7784 tasks, 0 lost, 1.2%
+      duplicates; at-most-once violations: ZERO in both.
 - [ ] Docs site, CI, semver releases
 
 ## Nice to have (not planned — review on demand)

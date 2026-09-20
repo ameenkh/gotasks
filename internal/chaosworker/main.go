@@ -12,6 +12,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/ameenkh/gotasks"
@@ -33,13 +34,24 @@ func main() {
 	db := env("GOTASKS_CHAOS_DB", "gotasks_test")
 	ns := os.Getenv("GOTASKS_CHAOS_NS")
 	name := env("GOTASKS_CHAOS_NAME", "chaos")
-	reap := 60 * time.Second // realistic default — the chaos run must prove
-	// recovery at production cadence, not only with test-tuned intervals
-	if d, err := time.ParseDuration(env("GOTASKS_CHAOS_REAP", "")); err == nil && d > 0 {
-		reap = d
-	}
 	if ns == "" {
 		log.Fatal("GOTASKS_CHAOS_NS required")
+	}
+	// Every knob env-tunable so chaos profiles configure the fixture:
+	dur := func(key string, def time.Duration) time.Duration {
+		if d, err := time.ParseDuration(os.Getenv(key)); err == nil && d > 0 {
+			return d
+		}
+		return def
+	}
+	lease := dur("GOTASKS_CHAOS_LEASE", 60*time.Second)
+	qlease := dur("GOTASKS_CHAOS_QLEASE", lease)
+	reap := dur("GOTASKS_CHAOS_REAP", 60*time.Second)
+	finalize := dur("GOTASKS_CHAOS_FINALIZE", 300*time.Millisecond)
+	poll := dur("GOTASKS_CHAOS_POLL", 2*time.Second)
+	claimBatch := 0 // 0 = single mode
+	if v, err := strconv.Atoi(os.Getenv("GOTASKS_CHAOS_BATCH")); err == nil && v > 0 {
+		claimBatch = v
 	}
 
 	ctx := context.Background()
@@ -54,23 +66,26 @@ func main() {
 	}
 	ledger := client.Database(db).Collection(ns + "_ledger")
 
-	m, err := gotasks.New(st,
+	opts := []gotasks.Option{
 		gotasks.WithQueues(
 			gotasks.QueuePolicy{Name: "jobs", MaxAttempts: 5},
 			gotasks.QueuePolicy{Name: "once", MaxAttempts: 1},
 		),
 		gotasks.WithWorkers(4),
 		gotasks.WithManagerName(name),
-		gotasks.WithPollInterval(50*time.Millisecond),
-		gotasks.WithLeaseTime(3*time.Second), // short: corpses recover fast
-		gotasks.WithBackoff(gotasks.FixedBackoff(100*time.Millisecond)),
+		gotasks.WithPollInterval(poll),
+		gotasks.WithLeaseTime(lease),
+		gotasks.WithBackoff(gotasks.FixedBackoff(100 * time.Millisecond)),
 		gotasks.WithJanitor(gotasks.JanitorConfig{ReapInterval: reap}),
-		gotasks.WithPipelineMode(gotasks.PipelineConfig{
-			ClaimBatch:       8,
-			QueueLease:       3 * time.Second,
-			FinalizeInterval: 200 * time.Millisecond, // widest ack crash window
-		}),
-	)
+	}
+	if claimBatch > 0 {
+		opts = append(opts, gotasks.WithPipelineMode(gotasks.PipelineConfig{
+			ClaimBatch:       claimBatch,
+			QueueLease:       qlease,
+			FinalizeInterval: finalize, // the ack crash window
+		}))
+	}
+	m, err := gotasks.New(st, opts...)
 	if err != nil {
 		log.Fatal(err)
 	}

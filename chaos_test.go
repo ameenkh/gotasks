@@ -10,10 +10,16 @@ package gotasks_test
 //   3. At-least-once is bounded: executions <= attempts <= max_attempts.
 //   4. Done implies executed: no task completes without a ledger record.
 //
-// Gated (minutes-long, kills processes): GOTASKS_CHAOS=1 go test -run TestChaos .
-// Storm length: GOTASKS_CHAOS_DURATION (default 90s — long enough for the
-// fixture's realistic 60s reap interval to fire mid-storm; override the
-// cadence with GOTASKS_CHAOS_REAP).
+// Profiles (edit/add in chaosProfiles below): "realistic" runs library
+// defaults — single mode, 60s lease, 60s reap — with occasional kills;
+// "aggressive" runs pipeline mode with tiny leases and near-constant kills.
+//
+// Gated (minutes-long, kills processes):
+//
+//	GOTASKS_CHAOS=1 go test -run TestChaos .
+//
+// GOTASKS_CHAOS_DURATION overrides the storm length per profile;
+// GOTASKS_CHAOS_PROFILE runs a single profile by name.
 
 import (
 	"context"
@@ -35,15 +41,53 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+// chaosProfile is one storm configuration. Fixture fields are passed to
+// internal/chaosworker via env; storm fields drive the killer/producer.
+type chaosProfile struct {
+	name string
+
+	// storm shape
+	storm        time.Duration // default; GOTASKS_CHAOS_DURATION overrides
+	procs        int           // concurrent worker processes
+	killEveryMin time.Duration
+	killEveryMax time.Duration
+	enqueueEvery time.Duration
+	drainGrace   time.Duration // post-storm budget for full recovery
+
+	// fixture (worker process) tuning; zero values = library-ish defaults
+	lease, queueLease, reap, finalize, poll time.Duration
+	claimBatch                              int // 0 = single mode
+}
+
+var chaosProfiles = []chaosProfile{
+	{
+		// Library defaults, gentle failures: proves recovery at production
+		// cadence (60s lease, 60s reap, single mode, 2s poll) — a corpse's
+		// work genuinely waits a full lease before rescue.
+		name:  "realistic",
+		storm: 90 * time.Second, procs: 3,
+		killEveryMin: 5 * time.Second, killEveryMax: 10 * time.Second,
+		enqueueEvery: 10 * time.Millisecond,
+		drainGrace:   3 * time.Minute, // lease(60s) + reap(60s) + slack
+		// fixture: all zero -> defaults (single mode)
+	},
+	{
+		// Everything cranked: pipeline mode (widest ack crash windows),
+		// tiny leases, a kill roughly every 700ms.
+		name:  "aggressive",
+		storm: 90 * time.Second, procs: 4,
+		killEveryMin: 400 * time.Millisecond, killEveryMax: time.Second,
+		enqueueEvery: 4 * time.Millisecond,
+		drainGrace:   90 * time.Second,
+		lease:        2 * time.Second, queueLease: 2 * time.Second,
+		reap: 2 * time.Second, finalize: 100 * time.Millisecond,
+		poll: 100 * time.Millisecond, claimBatch: 16,
+	},
+}
+
 func TestChaos(t *testing.T) {
 	if os.Getenv("GOTASKS_CHAOS") == "" {
 		t.Skip("chaos test skipped: set GOTASKS_CHAOS=1 (kills processes, runs minutes)")
-	}
-	storm := 90 * time.Second
-	if s := os.Getenv("GOTASKS_CHAOS_DURATION"); s != "" {
-		if d, err := time.ParseDuration(s); err == nil && d > 0 {
-			storm = d
-		}
 	}
 	uri := os.Getenv("GOTASKS_TEST_MONGO_URI")
 	if uri == "" {
@@ -56,34 +100,64 @@ func TestChaos(t *testing.T) {
 	if err != nil || client.Ping(ctx, nil) != nil {
 		t.Skipf("no MongoDB at %s", uri)
 	}
-	db := "gotasks_test"
-	ns := fmt.Sprintf("chaos_%d", time.Now().UnixNano())
-	t.Cleanup(func() {
-		for _, c := range []string{"_tasks", "_queues", "_metrics", "_ledger"} {
-			_ = client.Database(db).Collection(ns + c).Drop(ctx)
-		}
-		_ = client.Disconnect(ctx)
-	})
+	t.Cleanup(func() { _ = client.Disconnect(ctx) })
 
-	// Build the fixture worker.
 	bin := filepath.Join(t.TempDir(), "chaosworker")
 	if out, err := exec.Command("go", "build", "-o", bin, "./internal/chaosworker").CombinedOutput(); err != nil {
 		t.Fatalf("build fixture: %v\n%s", err, out)
 	}
 
-	// Worker process management.
+	only := os.Getenv("GOTASKS_CHAOS_PROFILE")
+	for _, p := range chaosProfiles {
+		if only != "" && p.name != only {
+			continue
+		}
+		t.Run(p.name, func(t *testing.T) { runChaos(t, client, bin, uri, p) })
+	}
+}
+
+func runChaos(t *testing.T, client *mongo.Client, bin, uri string, p chaosProfile) {
+	ctx := context.Background()
+	storm := p.storm
+	if s := os.Getenv("GOTASKS_CHAOS_DURATION"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			storm = d
+		}
+	}
+	db := "gotasks_test"
+	ns := fmt.Sprintf("chaos_%s_%d", p.name, time.Now().UnixNano())
+	t.Cleanup(func() {
+		for _, c := range []string{"_tasks", "_queues", "_metrics", "_ledger"} {
+			_ = client.Database(db).Collection(ns + c).Drop(ctx)
+		}
+	})
+
+	fixtureEnv := append(os.Environ(),
+		"GOTASKS_CHAOS_URI="+uri, "GOTASKS_CHAOS_DB="+db, "GOTASKS_CHAOS_NS="+ns)
+	addDur := func(key string, d time.Duration) {
+		if d > 0 {
+			fixtureEnv = append(fixtureEnv, fmt.Sprintf("%s=%s", key, d))
+		}
+	}
+	addDur("GOTASKS_CHAOS_LEASE", p.lease)
+	addDur("GOTASKS_CHAOS_QLEASE", p.queueLease)
+	addDur("GOTASKS_CHAOS_REAP", p.reap)
+	addDur("GOTASKS_CHAOS_FINALIZE", p.finalize)
+	addDur("GOTASKS_CHAOS_POLL", p.poll)
+	if p.claimBatch > 0 {
+		fixtureEnv = append(fixtureEnv, fmt.Sprintf("GOTASKS_CHAOS_BATCH=%d", p.claimBatch))
+	}
+
 	var mu sync.Mutex
 	var kills, spawned int
-	procs := make([]*exec.Cmd, 3)
-	spawn := func(i int) *exec.Cmd {
+	procs := make([]*exec.Cmd, p.procs)
+	spawn := func() *exec.Cmd {
 		mu.Lock()
 		spawned++
 		n := spawned
 		mu.Unlock()
 		cmd := exec.Command(bin)
-		cmd.Env = append(os.Environ(),
-			"GOTASKS_CHAOS_URI="+uri, "GOTASKS_CHAOS_DB="+db,
-			"GOTASKS_CHAOS_NS="+ns, fmt.Sprintf("GOTASKS_CHAOS_NAME=w%d", n))
+		cmd.Env = append(fixtureEnv, fmt.Sprintf("GOTASKS_CHAOS_NAME=%s-w%d", p.name, n))
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("spawn worker: %v", err)
 		}
@@ -94,20 +168,19 @@ func TestChaos(t *testing.T) {
 		_ = cmd.Wait()
 	}
 	for i := range procs {
-		procs[i] = spawn(i)
+		procs[i] = spawn()
 	}
 	t.Cleanup(func() {
 		mu.Lock()
 		defer mu.Unlock()
-		for _, p := range procs {
-			if p != nil {
-				killProc(p)
+		for _, c := range procs {
+			if c != nil {
+				killProc(c)
 			}
 		}
 	})
 
-	// Producer: an enqueue-only manager (never Started) with the same
-	// declared policies as the workers (registry drift guard must agree).
+	// Producer: enqueue-only manager, same declared policies as workers.
 	pst, err := mongostore.New(ctx, uri,
 		mongostore.WithDatabase(db), mongostore.WithNamespace(ns))
 	if err != nil {
@@ -129,14 +202,15 @@ func TestChaos(t *testing.T) {
 	wg.Add(1)
 	go func() { // the killer
 		defer wg.Done()
+		spread := int(p.killEveryMax - p.killEveryMin)
 		for time.Now().Before(stormEnd) {
-			time.Sleep(time.Duration(1000+rand.Intn(2000)) * time.Millisecond)
+			time.Sleep(p.killEveryMin + time.Duration(rand.Intn(spread+1)))
 			i := rand.Intn(len(procs))
 			mu.Lock()
 			victim := procs[i]
 			mu.Unlock()
 			killProc(victim)
-			replacement := spawn(i)
+			replacement := spawn()
 			mu.Lock()
 			procs[i] = replacement
 			kills++
@@ -156,18 +230,18 @@ func TestChaos(t *testing.T) {
 					onceN.Add(1)
 				}
 			}
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(p.enqueueEvery)
 		}
 	}()
 	wg.Wait()
 	total := jobsN.Load() + onceN.Load()
-	t.Logf("storm over: %d tasks enqueued (%d jobs, %d once), %d workers SIGKILLed",
-		total, jobsN.Load(), onceN.Load(), kills)
+	t.Logf("[%s] storm over: %d tasks enqueued (%d jobs, %d once), %d workers SIGKILLed",
+		p.name, total, jobsN.Load(), onceN.Load(), kills)
 
-	// Drain: the current (post-storm) workers finish everything. Stale
-	// claims from corpses recover via the 3s lease + reaper.
+	// Drain: survivors finish everything; stale claims recover via lease
+	// expiry + reap at the PROFILE's cadence.
 	tasksCol := client.Database(db).Collection(ns + "_tasks")
-	deadline := time.Now().Add(3 * time.Minute)
+	deadline := time.Now().Add(p.drainGrace)
 	quiet := 0
 	for {
 		n, err := tasksCol.CountDocuments(ctx, bson.M{"status": bson.M{"$in": bson.A{"pending", "running"}}})
@@ -182,14 +256,13 @@ func TestChaos(t *testing.T) {
 			quiet = 0
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("INVARIANT 1 VIOLATED: %d tasks still pending/running 2m after the storm", n)
+			t.Fatalf("INVARIANT 1 VIOLATED: %d tasks still pending/running %s after the storm", n, p.drainGrace)
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	// Stop all writers before auditing.
 	mu.Lock()
-	for i, p := range procs {
-		killProc(p)
+	for i, c := range procs { // stop all writers before auditing
+		killProc(c)
 		procs[i] = nil
 	}
 	mu.Unlock()
@@ -207,7 +280,6 @@ func TestChaos(t *testing.T) {
 		t.Errorf("INVARIANT 1: done(%d)+dead(%d) = %d, want %d — tasks lost", done, dead, done+dead, total)
 	}
 
-	// Execution counts per task from the handlers' own ledger.
 	ledger := client.Database(db).Collection(ns + "_ledger")
 	cur, err := ledger.Aggregate(ctx, mongo.Pipeline{
 		{{Key: "$group", Value: bson.M{"_id": "$task_id", "n": bson.M{"$sum": 1}}}},
@@ -271,7 +343,8 @@ func TestChaos(t *testing.T) {
 		t.Fatalf("cursor: %v", err)
 	}
 
-	t.Logf("audit: %d done, %d dead (%d once-tasks killed before running); "+
+	t.Logf("[%s] audit: %d done, %d dead (%d once-tasks killed before running); "+
 		"duplicate executions: %d retryable (documented at-least-once window), "+
-		"%d at-most-once (MUST be 0)", done, dead, onceDead, duplicates-onceDuplicates, onceDuplicates)
+		"%d at-most-once (MUST be 0)",
+		p.name, done, dead, onceDead, duplicates-onceDuplicates, onceDuplicates)
 }

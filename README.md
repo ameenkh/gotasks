@@ -295,9 +295,12 @@ audits the database against an execution ledger written by the handlers
 themselves: **nothing lost** (done+dead equals enqueued), **at-most-once
 is absolute** (`MaxAttempts: 1` tasks execute at most once across every
 kill), executions never exceed attempts, and nothing completes without
-executing. Duplicate executions of retryable tasks do occur — that's the
-documented at-least-once contract — and the test reports the measured rate
-(~2% under a kill every 1–3s).
+executing. Two profiles run in CI: *realistic* (library defaults — 60s
+lease/reap, single mode, a kill every 5–10s: 0.1% duplicate executions of
+retryable tasks) and *aggressive* (pipeline mode, 2s leases, a kill every
+~0.7s: 1.2% duplicates). Duplicates are the documented at-least-once
+contract; the measured rate scales with the crash rate, and at-most-once
+violations are zero in both profiles.
 
 ## Benchmarks
 

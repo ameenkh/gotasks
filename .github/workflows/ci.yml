@@ -45,8 +45,17 @@ jobs:
       - name: Scenario soak tests (30s each, parallel)
         run: go test . -run TestScenario -count=1 -timeout 15m -v
 
-      - name: Chaos test (SIGKILL workers under load, audit invariants)
+      # Chaos profiles run as separate steps for per-profile visibility.
+      # Profile VALUES live in chaos_test.go (type-checked, reviewed, and
+      # identical locally and in CI); YAML only selects and paces them.
+      - name: Chaos — realistic (library defaults, gentle kills)
         env:
           GOTASKS_CHAOS: "1"
-          GOTASKS_CHAOS_DURATION: 90s
-        run: go test . -run TestChaos -count=1 -timeout 15m -v
+          GOTASKS_CHAOS_PROFILE: realistic
+        run: go test . -run TestChaos -count=1 -timeout 10m -v
+
+      - name: Chaos — aggressive (pipeline mode, tiny leases, constant kills)
+        env:
+          GOTASKS_CHAOS: "1"
+          GOTASKS_CHAOS_PROFILE: aggressive
+        run: go test . -run TestChaos -count=1 -timeout 10m -v
