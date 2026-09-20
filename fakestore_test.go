@@ -13,6 +13,9 @@ import (
 
 // fakeStore is an in-memory Store used to test the manager without MongoDB.
 // It honors the same claim/fencing/unique-key semantics as real stores.
+// NOTE: stores/memstore is the public twin of this fake — behavioral
+// changes here should be mirrored there (internal tests cannot import
+// memstore: package gotasks <- memstore would be an import cycle).
 type fakeStore struct {
 	mu    sync.Mutex
 	seq   int

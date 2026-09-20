@@ -2,8 +2,10 @@ package gotasks
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1054,5 +1056,97 @@ func TestMetricsOffByDefault(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if n := len(fs.metrics); n != 0 {
 		t.Errorf("metrics written with metrics disabled: %d docs", n)
+	}
+}
+
+func TestMiddlewareWrapsInOrderAndSeesResult(t *testing.T) {
+	fs := newFakeStore()
+	var mu sync.Mutex
+	var order []string
+	mark := func(s string) { mu.Lock(); order = append(order, s); mu.Unlock() }
+	mw := func(name string) Middleware {
+		return func(next HandlerFunc) HandlerFunc {
+			return func(ctx context.Context, task *Task, payload json.RawMessage) (any, error) {
+				mark(name + ":before")
+				res, err := next(ctx, task, payload)
+				mark(name + ":after")
+				if m, ok := res.(map[string]string); ok {
+					m["seen_by"] = name // middleware sees the real result value
+				}
+				return res, err
+			}
+		}
+	}
+	m := testManager(t, fs, WithMiddleware(mw("outer"), mw("inner")))
+	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		mark("handler")
+		return map[string]string{"ok": "yes"}, nil
+	})
+	id, _ := Enqueue(context.Background(), m, "default", "job", struct{}{})
+	startManager(t, m)
+	task := waitForStatus(t, fs, id, StatusDone)
+
+	mu.Lock()
+	got := strings.Join(order, ",")
+	mu.Unlock()
+	if got != "outer:before,inner:before,handler,inner:after,outer:after" {
+		t.Errorf("middleware order = %s", got)
+	}
+	if !strings.Contains(string(task.Result), `"seen_by":"outer"`) {
+		t.Errorf("outermost middleware's result mutation lost: %s", task.Result)
+	}
+}
+
+func TestHooksFireAcrossLifecycle(t *testing.T) {
+	fs := newFakeStore()
+	var enq, claim, complete, fail, dead atomic.Int32
+	var lastDur atomic.Int64
+	m := testManager(t, fs, WithHooks(Hooks{
+		OnEnqueue:  func(task *Task) { enq.Add(1) },
+		OnClaim:    func(task *Task) { claim.Add(1) },
+		OnComplete: func(task *Task, d time.Duration) { complete.Add(1); lastDur.Store(int64(d)) },
+		OnFail:     func(task *Task, err error, willRetry bool) { fail.Add(1) },
+		OnDead:     func(task *Task, err error) { dead.Add(1) },
+	}))
+	var calls atomic.Int32
+	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, p struct{ Fail bool }) (any, error) {
+		calls.Add(1)
+		time.Sleep(5 * time.Millisecond)
+		if p.Fail {
+			return nil, errors.New("boom")
+		}
+		return nil, nil
+	})
+	ctx := context.Background()
+	okID, _ := Enqueue(ctx, m, "default", "job", struct{ Fail bool }{false})
+	badID, _ := Enqueue(ctx, m, "default", "job", struct{ Fail bool }{true}, TaskPolicy{MaxAttempts: 2})
+	startManager(t, m)
+	waitForStatus(t, fs, okID, StatusDone)
+	waitForStatus(t, fs, badID, StatusDead)
+
+	if enq.Load() != 2 || claim.Load() != calls.Load() || complete.Load() != 1 {
+		t.Errorf("enq=%d claim=%d (calls=%d) complete=%d", enq.Load(), claim.Load(), calls.Load(), complete.Load())
+	}
+	if fail.Load() != 2 || dead.Load() != 1 { // two failed attempts, one terminal
+		t.Errorf("fail=%d dead=%d, want 2/1", fail.Load(), dead.Load())
+	}
+	if lastDur.Load() < int64(5*time.Millisecond) {
+		t.Errorf("OnComplete duration = %v, want >= 5ms", time.Duration(lastDur.Load()))
+	}
+}
+
+func TestHookPanicDoesNotAffectOutcome(t *testing.T) {
+	fs := newFakeStore()
+	m := testManager(t, fs, WithHooks(Hooks{
+		OnComplete: func(task *Task, d time.Duration) { panic("hook bug") },
+	}))
+	_ = RegisterHandler(m, "job", func(ctx context.Context, task *Task, _ struct{}) (any, error) {
+		return nil, nil
+	})
+	id, _ := Enqueue(context.Background(), m, "default", "job", struct{}{})
+	startManager(t, m)
+	task := waitForStatus(t, fs, id, StatusDone) // still done, hook panic swallowed
+	if task.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1", task.Attempts)
 	}
 }

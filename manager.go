@@ -333,9 +333,15 @@ func EnqueueMany[T any](ctx context.Context, m *Manager, queue, taskType string,
 	}
 	ids, err := m.store.Enqueue(ctx, tasks)
 	var inserted int64
-	for _, id := range ids {
-		if id != "" {
-			inserted++
+	for i, id := range ids {
+		if id == "" {
+			continue
+		}
+		inserted++
+		if m.cfg.Hooks.OnEnqueue != nil {
+			tasks[i].ID = id
+			t := tasks[i]
+			fireHook(m, "OnEnqueue", func() { m.cfg.Hooks.OnEnqueue(t) })
 		}
 	}
 	m.count(queue, func(c *queueCounters) *atomic.Int64 { return &c.enqueued }, inserted)
@@ -381,16 +387,25 @@ func RegisterHandler[T any](m *Manager, taskType string, fn func(ctx context.Con
 	for _, o := range opts {
 		o(&ho)
 	}
+	// The typed handler in raw form, wrapped by the configured middleware
+	// (first = outermost), with result encoding outside the whole chain so
+	// middleware sees the handler's actual return value.
+	raw := HandlerFunc(func(ctx context.Context, t *Task, payload json.RawMessage) (any, error) {
+		var p T
+		if len(payload) > 0 {
+			if err := json.Unmarshal(payload, &p); err != nil {
+				return nil, fmt.Errorf("decode payload: %w", err)
+			}
+		}
+		return fn(ctx, t, p)
+	})
+	for i := len(m.cfg.Middleware) - 1; i >= 0; i-- {
+		raw = m.cfg.Middleware[i](raw)
+	}
 	m.handlers[taskType] = handlerEntry{
 		timeout: ho.timeout,
 		fn: func(ctx context.Context, t *Task) (json.RawMessage, error) {
-			var p T
-			if len(t.Payload) > 0 {
-				if err := json.Unmarshal(t.Payload, &p); err != nil {
-					return nil, fmt.Errorf("decode payload: %w", err)
-				}
-			}
-			res, err := fn(ctx, t, p)
+			res, err := raw(ctx, t, t.Payload)
 			if err != nil || res == nil {
 				return nil, err
 			}
@@ -405,6 +420,20 @@ func RegisterHandler[T any](m *Manager, taskType string, fn func(ctx context.Con
 		},
 	}
 	return nil
+}
+
+// fireHook runs one hook with panic isolation: hooks observe, they never
+// affect a task's outcome.
+func fireHook(m *Manager, name string, f func()) {
+	if f == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			m.cfg.Logger.Error("gotasks: hook panicked", "hook", name, "panic", r)
+		}
+	}()
+	f()
 }
 
 // ensureRegistered records this manager's queue declarations in the store's

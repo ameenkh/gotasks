@@ -109,6 +109,52 @@ pending ──claim (atomic, +1 attempt, new lease)──▶ running ──ok─
 
 ## Queues and ordering
 
+## Testing your code (no MongoDB needed)
+
+`stores/memstore` is an in-memory `Store` with the engine's real semantics
+(atomic claims, lease fencing, unique keys, requeue, reaping, the registry)
+— gotasks' own manager test suite runs on it. Unit-test your handlers and
+enqueue flows in milliseconds, deterministically, no Docker:
+
+```go
+st := memstore.New()
+m, _ := gotasks.New(st, gotasks.WithQueues(gotasks.QueuePolicy{Name: "emails"}))
+gotasks.RegisterHandler(m, "send", mySendHandler)
+gotasks.Enqueue(ctx, m, "emails", "send", payload)
+m.Start()
+// ... poll st.Task(id) for assertions
+```
+
+Not a production store: nothing persists, single process only.
+
+## Hooks & middleware
+
+Attach your observability stack without gotasks knowing it exists.
+**Middleware** wraps handler execution (tracing spans, timing, log
+enrichment — first registered is outermost); **hooks** are observe-only
+lifecycle callbacks (they run on worker goroutines: keep them fast; a
+panicking hook is recovered and logged, never affecting the task):
+
+```go
+gotasks.New(store,
+    gotasks.WithMiddleware(func(next gotasks.HandlerFunc) gotasks.HandlerFunc {
+        return func(ctx context.Context, t *gotasks.Task, payload json.RawMessage) (any, error) {
+            ctx, span := tracer.Start(ctx, "task."+t.Type)
+            defer span.End()
+            return next(ctx, t, payload)
+        }
+    }),
+    gotasks.WithHooks(gotasks.Hooks{
+        OnDead:     func(t *gotasks.Task, err error) { alerting.Page("task dead: " + t.Type) },
+        OnComplete: func(t *gotasks.Task, d time.Duration) { latency.Observe(d.Seconds()) },
+        // OnEnqueue, OnClaim, OnFail(err, willRetry) ...
+    }),
+)
+```
+
+(Reaper-detected zombie deaths don't fire OnDead — no worker context exists
+there; watch the dead gauge in metrics for those.)
+
 ## Dashboard
 
 ```go

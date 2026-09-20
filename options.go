@@ -1,6 +1,8 @@
 package gotasks
 
 import (
+	"context"
+	"encoding/json"
 	"log/slog"
 	"time"
 )
@@ -71,8 +73,44 @@ type Config struct {
 	// lease as "{managerID}.worker.{n}" (fetcher: "{managerID}.fetcher"),
 	// and metrics counters are attributed to the ManagerID.
 	ManagerName string
+	// Hooks are observe-only lifecycle callbacks (see Hooks). They run on
+	// worker goroutines: keep them fast and non-blocking. A panicking hook
+	// is recovered and logged; hooks never affect a task's outcome.
+	Hooks Hooks
+	// Middleware wraps handler execution (outermost first): tracing spans,
+	// timing, log enrichment. Applied identically to every handler at
+	// registration time.
+	Middleware []Middleware
 	// Logger receives worker/reaper diagnostics. Default slog.Default().
 	Logger *slog.Logger
+}
+
+// HandlerFunc is the raw executable form of a handler that Middleware
+// wraps: the payload is still JSON, the result is whatever the (typed)
+// handler returned.
+type HandlerFunc func(ctx context.Context, t *Task, payload json.RawMessage) (any, error)
+
+// Middleware wraps a HandlerFunc. The first middleware passed to
+// WithMiddleware is the outermost.
+type Middleware func(next HandlerFunc) HandlerFunc
+
+// Hooks are observe-only lifecycle callbacks. Every field is optional.
+// They observe, they never decide: returning is their only effect, and a
+// panic inside a hook is recovered and logged without touching the task.
+type Hooks struct {
+	// OnEnqueue fires once per successfully inserted task.
+	OnEnqueue func(t *Task)
+	// OnClaim fires when this manager takes ownership of a task.
+	OnClaim func(t *Task)
+	// OnComplete fires when a handler succeeds; d is the handler duration.
+	OnComplete func(t *Task, d time.Duration)
+	// OnFail fires on every failed attempt; willRetry=false means the
+	// task is going to the dead-letter state (OnDead fires too).
+	OnFail func(t *Task, err error, willRetry bool)
+	// OnDead fires when a worker's terminal failure sends a task to the
+	// dead-letter state. (Reaper-detected zombie deaths don't fire it —
+	// no worker context exists there; watch the dead gauge for those.)
+	OnDead func(t *Task, err error)
 }
 
 // JanitorConfig groups the janitor's duties. The janitor itself is a
@@ -125,6 +163,17 @@ func WithoutChangeStream() Option {
 // stream is active (see Config.FallbackPoll).
 func WithFallbackPoll(d time.Duration) Option {
 	return func(c *Config) { c.FallbackPoll = d }
+}
+
+// WithHooks sets the lifecycle hooks (see Hooks). Last call wins whole.
+func WithHooks(h Hooks) Option {
+	return func(c *Config) { c.Hooks = h }
+}
+
+// WithMiddleware appends handler middleware; the first registered is the
+// outermost.
+func WithMiddleware(mw ...Middleware) Option {
+	return func(c *Config) { c.Middleware = append(c.Middleware, mw...) }
 }
 
 // WithManagerName sets the developer-chosen label for this manager

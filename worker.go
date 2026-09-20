@@ -35,6 +35,9 @@ func (m *Manager) workerLoop(id string) {
 		switch {
 		case err == nil && t != nil:
 			m.count(t.Queue, func(c *queueCounters) *atomic.Int64 { return &c.claimed }, 1)
+			if h := m.cfg.Hooks.OnClaim; h != nil {
+				fireHook(m, "OnClaim", func() { h(t) })
+			}
 			m.process(id, t)
 			continue // railway: go straight for the next task
 		case errors.Is(err, ErrNoTask):
@@ -71,7 +74,9 @@ func (m *Manager) process(workerID string, t *Task) {
 	}
 
 	stopHeartbeat := m.startHeartbeat(t, baseCancel)
+	started := time.Now()
 	result, err := m.invoke(entry, hctx, t)
+	duration := time.Since(started)
 	stopHeartbeat()
 
 	var o Outcome
@@ -83,6 +88,14 @@ func (m *Manager) process(workerID string, t *Task) {
 		} else {
 			m.count(t.Queue, func(c *queueCounters) *atomic.Int64 { return &c.failed }, 1)
 		}
+		if h := m.cfg.Hooks.OnFail; h != nil {
+			fireHook(m, "OnFail", func() { h(t, err, !terminal) })
+		}
+		if terminal {
+			if h := m.cfg.Hooks.OnDead; h != nil {
+				fireHook(m, "OnDead", func() { h(t, err) })
+			}
+		}
 		taskErr := TaskError{At: now, Attempt: t.Attempts, Worker: workerID, Message: err.Error()}
 		o = Outcome{Task: t, Failure: &taskErr, RetryAt: now.Add(m.cfg.Backoff.Next(t.Attempts)), Terminal: terminal}
 		m.cfg.Logger.Warn("gotasks: task attempt failed",
@@ -90,6 +103,9 @@ func (m *Manager) process(workerID string, t *Task) {
 			"terminal", terminal, "error", err)
 	} else {
 		m.count(t.Queue, func(c *queueCounters) *atomic.Int64 { return &c.done }, 1)
+		if h := m.cfg.Hooks.OnComplete; h != nil {
+			fireHook(m, "OnComplete", func() { h(t, duration) })
+		}
 		o = Outcome{Task: t, Result: result}
 	}
 	if m.shouldBufferOutcome(t) {

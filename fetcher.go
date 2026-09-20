@@ -39,6 +39,10 @@ func (m *Manager) fetcherLoop() {
 		case err == nil:
 			for _, t := range tasks {
 				m.count(t.Queue, func(c *queueCounters) *atomic.Int64 { return &c.claimed }, 1)
+				if h := m.cfg.Hooks.OnClaim; h != nil {
+					t := t
+					fireHook(m, "OnClaim", func() { h(t) })
+				}
 				select {
 				case m.taskCh <- t:
 				case <-m.claimCtx.Done():

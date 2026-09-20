@@ -366,13 +366,27 @@ and visibility, runs on nothing but a Go binary and a Mongo cluster
 
 ## v1.0 — Ecosystem
 
-- [ ] Hooks/middleware (OnClaim/OnComplete/OnFail/OnDead)
+- [x] Hooks/middleware — implemented 2026-09-20. Middleware wraps handler
+      execution (HandlerFunc(ctx, task, rawPayload) -> (any, error); first
+      registered = outermost; sees the real result value; panics inside it
+      count as failed attempts like handler panics). Hooks are observe-only
+      lifecycle callbacks (OnEnqueue/OnClaim/OnComplete(d)/OnFail(err,
+      willRetry)/OnDead) with panic isolation — they never affect a task's
+      outcome; documented caveat: reaper zombie-deaths don't fire OnDead.
 - [ ] slog integration (done in v0.1), Prometheus metrics, OTel spans
 - [ ] Introspection API (counts by status/type, list/filter) + `gotasksctl`
 - [ ] Transactional enqueue via Mongo sessions (replica sets): Enqueue joins
       the caller's transaction so business writes and their tasks commit
       atomically — closes the gap with Postgres queues' headline feature
-- [ ] In-memory store promoted to a public package (users' unit tests)
+- [x] In-memory store — implemented 2026-09-20 as stores/memstore: full
+      Store contract incl. registry/metrics stubs + test helpers (Task,
+      Tasks, CounterTotals, MetricsCount, ForceLeaseLost). Acceptance test
+      runs a real manager end-to-end on it (retry, unique keys, drift
+      guard, at-most-once, requeue). NOTE: the internal fakestore_test.go
+      remains as the manager suite's double (import cycle prevents the
+      internal suite using memstore; the two must be kept in sync — a
+      migration of the suite to an external test package was attempted and
+      rolled back).
 - [ ] Benchmarks, chaos test (kill workers mid-task; assert no loss/dup)
 - [ ] Docs site, CI, semver releases
 
