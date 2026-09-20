@@ -59,3 +59,10 @@ jobs:
           GOTASKS_CHAOS: "1"
           GOTASKS_CHAOS_PROFILE: aggressive
         run: go test . -run TestChaos -count=1 -timeout 10m -v
+
+      - name: Chaos — failover (workers killed AND MongoDB restarted mid-storm)
+        env:
+          GOTASKS_CHAOS: "1"
+          GOTASKS_CHAOS_PROFILE: failover
+          GOTASKS_CHAOS_MONGO_DISRUPT: docker restart -t 2 mongo
+        run: go test . -run TestChaos -count=1 -timeout 10m -v

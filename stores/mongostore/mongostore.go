@@ -6,6 +6,13 @@
 // Task lifetime is enforced by a TTL index on expires_at (stamped at
 // enqueue from the queue's TTL policy), and unique keys are enforced with
 // a partial unique index (unique only while a task is active).
+//
+// Durability: the store pins writeConcern majority and readConcern
+// majority on all its collections, regardless of the deployment's
+// defaults. This is what makes the at-most-once guarantee hold across a
+// primary failover — a claim acknowledged at w:majority cannot be rolled
+// back by an election, so a re-claim of already-acked work is impossible
+// by construction (with w:1 it would merely be improbable).
 package mongostore
 
 import (
@@ -22,7 +29,9 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 )
 
 type config struct {
@@ -103,11 +112,17 @@ func build(ctx context.Context, client *mongo.Client, cfg config) (*Store, error
 	if cfg.enqueueChunk < 1 || cfg.enqueueChunk > 10000 {
 		return nil, fmt.Errorf("mongostore: enqueue chunk size must be 1..10000, got %d", cfg.enqueueChunk)
 	}
+	// Majority write+read concern, pinned: at-most-once must not depend on
+	// the deployment's defaults (an acked-then-rolled-back claim under w:1
+	// would erase the lease token and legitimize a duplicate run).
+	durable := options.Collection().
+		SetWriteConcern(writeconcern.Majority()).
+		SetReadConcern(readconcern.Majority())
 	s := &Store{
 		client:       client,
-		tasksCol:     client.Database(cfg.database).Collection(cfg.namespace + "_tasks"),
-		queuesCol:    client.Database(cfg.database).Collection(cfg.namespace + "_queues"),
-		metricsCol:   client.Database(cfg.database).Collection(cfg.namespace + "_metrics"),
+		tasksCol:     client.Database(cfg.database).Collection(cfg.namespace+"_tasks", durable),
+		queuesCol:    client.Database(cfg.database).Collection(cfg.namespace+"_queues", durable),
+		metricsCol:   client.Database(cfg.database).Collection(cfg.namespace+"_metrics", durable),
 		enqueueChunk: cfg.enqueueChunk,
 	}
 	if err := s.ensureIndexes(ctx); err != nil {

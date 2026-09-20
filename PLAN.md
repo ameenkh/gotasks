@@ -408,6 +408,18 @@ and visibility, runs on nothing but a Go binary and a Mongo cluster
       12 kills/90s) 6202 tasks, 0 lost, 0.1% duplicates; aggressive
       (pipeline, 2s leases, 123 kills/90s) 7784 tasks, 0 lost, 1.2%
       duplicates; at-most-once violations: ZERO in both.
+      External review response (2026-09-21, both findings fixed same day):
+      (1) WRITE CONCERN pinned — mongostore now sets writeConcern:majority
+      + readConcern:majority on all collections instead of inheriting
+      deployment defaults; closes the acked-then-rolled-back-claim class
+      by construction. (2) FAILOVER chaos profile added — workers killed
+      AND MongoDB restarted twice mid-storm (GOTASKS_CHAOS_MONGO_DISRUPT
+      command; own CI step): first run 5704 tasks / 10 kills / 2 db
+      outages / 0 lost / 0 at-most-once violations. Honest remaining
+      boundary (recorded): single-node RS — multi-node election/rollback
+      is covered by majority-concern construction, not yet by a test;
+      reviewer's surface-growth caution acknowledged (feature freeze
+      pressure toward v1.0).
 - [ ] Docs site, CI, semver releases
 
 ## Nice to have (not planned — review on demand)

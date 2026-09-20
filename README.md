@@ -295,12 +295,23 @@ audits the database against an execution ledger written by the handlers
 themselves: **nothing lost** (done+dead equals enqueued), **at-most-once
 is absolute** (`MaxAttempts: 1` tasks execute at most once across every
 kill), executions never exceed attempts, and nothing completes without
-executing. Two profiles run in CI: *realistic* (library defaults — 60s
+executing. Three profiles run in CI: *realistic* (library defaults — 60s
 lease/reap, single mode, a kill every 5–10s: 0.1% duplicate executions of
-retryable tasks) and *aggressive* (pipeline mode, 2s leases, a kill every
-~0.7s: 1.2% duplicates). Duplicates are the documented at-least-once
+retryable tasks), *aggressive* (pipeline mode, 2s leases, a kill every
+~0.7s: 1.2% duplicates), and *failover* (workers killed AND **MongoDB
+itself restarted twice mid-storm**: zero lost, zero at-most-once
+violations — driver reconnects, change-stream resume, and majority-acked
+claims surviving the outage). Duplicates are the documented at-least-once
 contract; the measured rate scales with the crash rate, and at-most-once
-violations are zero in both profiles.
+violations are zero in all profiles.
+
+**Durability**: the store pins `writeConcern: majority` and `readConcern:
+majority` on its collections regardless of deployment defaults — the
+at-most-once guarantee must not depend on an operator's cluster settings
+(an acked-then-rolled-back claim under `w:1` would erase the lease token
+and legitimize a duplicate run). Known remaining boundary: chaos runs
+against a single-node replica set; multi-node election/rollback scenarios
+are covered by the majority-concern construction but not yet by a test.
 
 ## Benchmarks
 

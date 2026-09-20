@@ -57,6 +57,11 @@ type chaosProfile struct {
 	// fixture (worker process) tuning; zero values = library-ish defaults
 	lease, queueLease, reap, finalize, poll time.Duration
 	claimBatch                              int // 0 = single mode
+
+	// disruptMongo restarts the database mid-storm (twice) using the shell
+	// command in GOTASKS_CHAOS_MONGO_DISRUPT (e.g. "docker restart mongo").
+	// The profile skips itself when that env is unset.
+	disruptMongo bool
 }
 
 var chaosProfiles = []chaosProfile{
@@ -82,6 +87,21 @@ var chaosProfiles = []chaosProfile{
 		lease:        2 * time.Second, queueLease: 2 * time.Second,
 		reap: 2 * time.Second, finalize: 100 * time.Millisecond,
 		poll: 100 * time.Millisecond, claimBatch: 16,
+	},
+	{
+		// Kills workers AND restarts MongoDB itself mid-storm: exercises
+		// driver reconnects, change-stream resume, claim/finalize failure
+		// paths, and — with the store's pinned w:majority — proves no
+		// acked work is lost across a database outage.
+		name:  "failover",
+		storm: 90 * time.Second, procs: 3,
+		killEveryMin: 8 * time.Second, killEveryMax: 15 * time.Second,
+		enqueueEvery: 10 * time.Millisecond,
+		drainGrace:   3 * time.Minute,
+		lease:        5 * time.Second, queueLease: 5 * time.Second,
+		reap: 5 * time.Second, finalize: 200 * time.Millisecond,
+		poll: 500 * time.Millisecond, claimBatch: 8,
+		disruptMongo: true,
 	},
 }
 
@@ -197,7 +217,32 @@ func runChaos(t *testing.T, client *mongo.Client, bin, uri string, p chaosProfil
 
 	stormEnd := time.Now().Add(storm)
 	var jobsN, onceN atomic.Int64
+	var disruptions int
 	var wg sync.WaitGroup
+
+	if p.disruptMongo {
+		disruptCmd := os.Getenv("GOTASKS_CHAOS_MONGO_DISRUPT")
+		if disruptCmd == "" {
+			t.Skip("failover profile needs GOTASKS_CHAOS_MONGO_DISRUPT (e.g. \"docker restart mongo\")")
+		}
+		wg.Add(1)
+		go func() { // the database disruptor: two outages per storm
+			defer wg.Done()
+			for _, at := range []time.Duration{storm / 3, 2 * storm / 3} {
+				wait := time.Until(stormEnd.Add(at - storm))
+				if wait > 0 {
+					time.Sleep(wait)
+				}
+				out, err := exec.Command("sh", "-c", disruptCmd).CombinedOutput()
+				if err != nil {
+					t.Errorf("mongo disrupt failed: %v\n%s", err, out)
+					return
+				}
+				disruptions++
+				t.Logf("[%s] mongo disrupted (%d)", p.name, disruptions)
+			}
+		}()
+	}
 
 	wg.Add(1)
 	go func() { // the killer
@@ -235,8 +280,8 @@ func runChaos(t *testing.T, client *mongo.Client, bin, uri string, p chaosProfil
 	}()
 	wg.Wait()
 	total := jobsN.Load() + onceN.Load()
-	t.Logf("[%s] storm over: %d tasks enqueued (%d jobs, %d once), %d workers SIGKILLed",
-		p.name, total, jobsN.Load(), onceN.Load(), kills)
+	t.Logf("[%s] storm over: %d tasks enqueued (%d jobs, %d once), %d workers SIGKILLed, %d db outages",
+		p.name, total, jobsN.Load(), onceN.Load(), kills, disruptions)
 
 	// Drain: survivors finish everything; stale claims recover via lease
 	// expiry + reap at the PROFILE's cadence.
