@@ -389,7 +389,17 @@ and visibility, runs on nothing but a Go binary and a Mongo cluster
       internal suite using memstore; the two must be kept in sync — a
       migration of the suite to an external test package was attempted and
       rolled back).
-- [ ] Benchmarks, chaos test (kill workers mid-task; assert no loss/dup)
+- [x] Chaos test — implemented 2026-09-20 (benchmarks were done in v0.3).
+      Real fixture worker processes (internal/chaosworker: pipeline mode +
+      batch finalize = widest crash windows, no signal handling, ledger
+      collection records every execution as external ground truth) are
+      SIGKILLed every 1-3s under a continuous stream, then survivors drain
+      and the test audits: (1) done+dead == enqueued, zero lost; (2)
+      at-most-once tasks executed <= 1 time ABSOLUTELY; (3) executions <=
+      attempts <= max_attempts; (4) done implies executed. Env-gated
+      (GOTASKS_CHAOS=1, GOTASKS_CHAOS_DURATION), own CI step at 30s. First
+      run: 2563 tasks / 12 kills / 0 lost / 0 violations; 2% duplicate
+      executions — the documented at-least-once window, now measured.
 - [ ] Docs site, CI, semver releases
 
 ## Nice to have (not planned — review on demand)

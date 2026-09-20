@@ -286,6 +286,19 @@ a min-timer fed from the same events, and a long safety-net poll
 this silently falls back to plain polling; `WithoutChangeStream()` forces
 polling explicitly.
 
+## Chaos-tested
+
+The crash-recovery claims are not just reasoned about: the chaos test
+(`GOTASKS_CHAOS=1 go test -run TestChaos .`, also a CI step) SIGKILLs real
+worker processes every 1–3 seconds under a continuous task stream, then
+audits the database against an execution ledger written by the handlers
+themselves: **nothing lost** (done+dead equals enqueued), **at-most-once
+is absolute** (`MaxAttempts: 1` tasks execute at most once across every
+kill), executions never exceed attempts, and nothing completes without
+executing. Duplicate executions of retryable tasks do occur — that's the
+documented at-least-once contract — and the test reports the measured rate
+(~2% under a kill every 1–3s).
+
 ## Benchmarks
 
 `go test -bench . -benchtime 2000x -run xxx .` (needs local MongoDB).
