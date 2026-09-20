@@ -149,7 +149,12 @@ cluster is the single source of truth:
   dot-separated: `{WithManagerName}.{random}` per instance, workers lease
   as `{managerID}.worker.{n}`.
 
-Metrics prune themselves via a TTL index (Retention). Off by default.
+Metrics prune themselves via their own TTL index (`Retention`, default 7d)
+— deliberately independent of any queue's task TTL: task TTL answers "how
+long does the work record matter" (per queue), metrics retention answers
+"how far back should the dashboard remember" (one ops decision), and the
+two often point in opposite directions (short-lived tasks still deserve
+weeks of throughput history). Off by default.
 
 Declared queues are recorded in a **queues registry** (a sibling
 `<tasks>_queues` collection): the first declaration registers a queue's
